@@ -5,25 +5,43 @@ Usage (from hooks.json):
   shunt-hook read   # Read tool
   shunt-hook bash   # Bash tool: cat/head/tail/less/more/rtk read
 
+Two rules for files over SHUNT_MIN_LINES lines:
+  - a whole-file read is denied;
+  - bounded reads (Read offset/limit, head, tail, rtk read --head-lines…) draw
+    on a per-session, per-file budget of distinct lines (SHUNT_READ_BUDGET,
+    default SHUNT_MIN_LINES), so the file can't be paged into context in
+    chunks. Re-reading lines already read costs nothing.
+
 Prints nothing to pass through (the normal permission flow decides), or a
 hookSpecificOutput deny with a reason. Never emits "allow": that would skip the
 user's permission prompts. Any internal error passes through (fails open).
 """
+import fcntl
 import glob
 import json
 import os
 import re
 import shlex
 import sys
+import tempfile
 
 DEFAULT_MIN_LINES = 600
+READ_TOOL_DEFAULT_LIMIT = 2000
 SEPARATORS = {";", "&&", "||", "&", "\n", ";;", "(", ")"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def env_lines(name, default):
+    raw = os.environ.get(name, "")
+    return int(raw) if raw.isdigit() else default
+
+
 def min_lines():
-    raw = os.environ.get("SHUNT_MIN_LINES", "")
-    return int(raw) if raw.isdigit() else DEFAULT_MIN_LINES
+    return env_lines("SHUNT_MIN_LINES", DEFAULT_MIN_LINES)
+
+
+def read_budget():
+    return env_lines("SHUNT_READ_BUDGET", min_lines())
 
 
 def count_lines(path):
@@ -51,6 +69,76 @@ def bulk_read_cmd(path):
         root, shlex.quote(path))
 
 
+def merge(spans):
+    """Union of inclusive (start, end) line spans, sorted and merged."""
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def charge(session_id, path, span):
+    """Lines of `path` read this session if `span` is allowed, recording it if
+    that stays within budget. Without a session id there is no ledger, so only
+    the span itself counts."""
+    budget = read_budget()
+    if not session_id:
+        return span[1] - span[0] + 1, budget
+    ledger_dir = os.path.join(tempfile.gettempdir(), "shunt-cc")
+    os.makedirs(ledger_dir, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json"
+    key = os.path.realpath(path)
+    # Parallel tool calls run hooks concurrently: lock around read-modify-write.
+    with open(os.path.join(ledger_dir, name), "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        try:
+            ledger = json.loads(f.read() or "{}")
+        except ValueError:
+            ledger = {}
+        spans = merge(ledger.get(key, []) + [list(span)])
+        covered = sum(end - start + 1 for start, end in spans)
+        if covered <= budget:
+            ledger[key] = spans
+            f.seek(0)
+            f.truncate()
+            json.dump(ledger, f)
+    return covered, budget
+
+
+def check_large_file(path, span, session_id, verb):
+    """Deny a whole or bounded read of a large file when it should be delegated."""
+    total, threshold = count_lines(path), min_lines()
+    if total is None or total <= threshold:
+        return
+    start, end = max(span[0], 1), min(span[1], total)
+    if start > end:
+        return
+    if start == 1 and end == total:
+        deny(
+            "shunt: {} is {} lines (SHUNT_MIN_LINES={}), too large to read whole{}. "
+            "To understand, summarize or search it, use the bulk-reader skill, "
+            "which sends the file to Haiku and returns only the answer:\n  {}\n"
+            "To edit it, Read only the lines you need with offset/limit "
+            "(grep -n finds them).".format(
+                path, total, threshold, " with `{}`".format(verb) if verb else "",
+                bulk_read_cmd(path)))
+    covered, budget = charge(session_id, path, (start, end))
+    if covered > budget:
+        deny(
+            "shunt: {} is {} lines. This read (lines {}-{}) would bring the lines of "
+            "it read this session to {}, over the budget of {} "
+            "(SHUNT_READ_BUDGET). Paging through a large file costs as much as "
+            "reading it whole. To understand, summarize or search it, use the "
+            "bulk-reader skill:\n  {}\n"
+            "To edit it, Read only the few lines you need (grep -n finds them); "
+            "lines you've already read don't count again.".format(
+                path, total, start, end, covered, budget, bulk_read_cmd(path)))
+
+
 def deny(reason):
     json.dump({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -62,23 +150,26 @@ def deny(reason):
 
 # ── Read tool ────────────────────────────────────────────────────────────────
 
-def check_read(tool_input):
-    # Targeted reads (offset/limit, even 0) and PDF page ranges pass through.
-    if any(k in tool_input for k in ("offset", "limit", "pages")):
-        return
+def as_int(value, default):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+def check_read(tool_input, session_id):
+    if "pages" in tool_input:
+        return  # PDF page ranges: Read handles these natively
     path = tool_input.get("file_path") or ""
     if not path or not os.path.isfile(path):
         return
-    lines, threshold = count_lines(path), min_lines()
-    if lines is None or lines <= threshold:
-        return
-    deny(
-        "shunt: {} is {} lines (SHUNT_MIN_LINES={}), too large to read whole. "
-        "To understand, summarize or search it, use the bulk-reader skill, which "
-        "sends the file to Haiku and returns only the answer:\n  {}\n"
-        "If you need exact content for an edit, Read it again with offset/limit "
-        "for just the section you need (grep -n can find it first).".format(
-            path, lines, threshold, bulk_read_cmd(path)))
+    if "offset" not in tool_input and "limit" not in tool_input:
+        span = (1, float("inf"))
+    else:
+        start = as_int(tool_input.get("offset"), 1)
+        span = (start, start + as_int(tool_input.get("limit"), READ_TOOL_DEFAULT_LIMIT) - 1)
+    check_large_file(path, span, session_id, None)
 
 
 # ── Bash tool ────────────────────────────────────────────────────────────────
@@ -163,7 +254,7 @@ def parse_count(value):
 
 
 def head_tail(name, args):
-    """Return (files, emit) where emit(total) is the number of lines printed."""
+    """Return (files, span) where span(total) is the (start, end) lines printed."""
     count, files, whole, i = 10, [], False, 0
     while i < len(args):
         a = args[i]
@@ -190,23 +281,21 @@ def head_tail(name, args):
 
     explicit = count != 10
 
-    def emit(total):
-        if whole and not explicit:
-            return total
-        if count is None:
-            return total
-        if isinstance(count, tuple):
-            kind, n = count
-            if kind == "from":  # tail -n +K: line K to end; head -n +K == K
-                return max(total - n + 1, 0) if name == "tail" else min(n, total)
-            return max(total - n, 0) if name == "head" else min(n, total)
-        return min(count, total)
+    def span(total):
+        if (whole and not explicit) or count is None:
+            return 1, total
+        kind, n = count if isinstance(count, tuple) else ("count", count)
+        if kind == "from":  # tail -n +K: line K to end; head -n +K == head -n K
+            return (n, total) if name == "tail" else (1, n)
+        if kind == "allbut" and name == "head":  # GNU head -n -K: all but last K
+            return 1, total - n
+        return (1, n) if name == "head" else (total - n + 1, total)
 
-    return files, emit
+    return files, span
 
 
 def rtk_read(args):
-    bound, files, i = None, [], 0
+    bound, kind, files, i = None, None, [], 0
     while i < len(args):
         a = args[i]
         if a in ("-l", "--level"):
@@ -214,16 +303,24 @@ def rtk_read(args):
             continue
         if a in ("-m", "--max-lines", "--head-lines", "--tail-lines") and i + 1 < len(args):
             n = parse_count(args[i + 1])
-            bound = n if isinstance(n, int) else bound
+            if isinstance(n, int):
+                bound, kind = n, a
             i += 2
             continue
         m = re.match(r"^--(max-lines|head-lines|tail-lines)=(\d+)$", a)
         if m:
-            bound = int(m.group(2))
+            bound, kind = int(m.group(2)), "--" + m.group(1)
         elif not a.startswith("-"):
             files.append(a)
         i += 1
-    return files, (lambda total: total if bound is None else min(bound, total))
+    def span(total):
+        if bound is None:
+            return 1, total
+        # --max-lines is a structural preview, not a contiguous range; count it
+        # as the first N lines.
+        return (total - bound + 1, total) if kind == "--tail-lines" else (1, bound)
+
+    return files, span
 
 
 def full(args):
@@ -233,11 +330,11 @@ def full(args):
             files.append(a)
         elif a == "--":
             rest = True
-    return files, (lambda total: total)
+    return files, (lambda total: (1, total))
 
 
 def read_targets(words):
-    """Map a simple command to (verb, files, emit) or None if it isn't a file read."""
+    """Map a simple command to (verb, files, span) or None if it isn't a file read."""
     words = unwrap(words)
     if not words:
         return None
@@ -245,8 +342,8 @@ def read_targets(words):
     if name in ("cat", "less", "more"):
         return (name,) + full(args)
     if name in ("head", "tail"):
-        files, emit = head_tail(name, args)
-        return (name, files, emit) if emit else None
+        files, span = head_tail(name, args)
+        return (name, files, span) if span else None
     if name == "rtk" and args and args[0] in ("read", "cat"):
         return ("rtk " + args[0],) + rtk_read(args[1:])
     return None
@@ -261,11 +358,10 @@ def resolve(path, cwd):
     return [path]
 
 
-def check_bash(tool_input, cwd):
+def check_bash(tool_input, cwd, session_id):
     command = tool_input.get("command") or ""
     if not command.strip():
         return
-    threshold = min_lines()
     for words, piped in split_commands(tokenize(command)):
         words, stdin_files, redirected = strip_redirects(words)
         unwrapped = unwrap(words)
@@ -279,25 +375,13 @@ def check_bash(tool_input, cwd):
         target = read_targets(words)
         if not target:
             continue
-        verb, files, emit = target
-        files = files or stdin_files
-        for f in files:
+        verb, files, span = target
+        for f in files or stdin_files:
             for path in resolve(f, cwd):
-                if not os.path.isfile(path):
-                    continue
-                total = count_lines(path)
-                if total is None or emit(total) <= threshold:
-                    continue
-                deny(
-                    "shunt: {} is {} lines (SHUNT_MIN_LINES={}); `{}` would put {} "
-                    "lines into context. To understand, summarize or search it, use "
-                    "the bulk-reader skill, which sends the file to Haiku and returns "
-                    "only the answer:\n  {}\n"
-                    "If you need exact content for an edit, use the Read tool with "
-                    "offset/limit for just the section you need (grep -n can find "
-                    "it first).".format(path, total, threshold, verb, emit(total),
-                                        bulk_read_cmd(path)))
-
+                if os.path.isfile(path):
+                    total = count_lines(path)
+                    if total:
+                        check_large_file(path, span(total), session_id, verb)
 
 def main():
     if os.environ.get("SHUNT_CHILD"):
@@ -306,10 +390,11 @@ def main():
     try:
         payload = json.load(sys.stdin)
         tool_input = payload.get("tool_input") or {}
+        session_id = payload.get("session_id") or ""
         if mode == "read":
-            check_read(tool_input)
+            check_read(tool_input, session_id)
         elif mode == "bash":
-            check_bash(tool_input, payload.get("cwd") or os.getcwd())
+            check_bash(tool_input, payload.get("cwd") or os.getcwd(), session_id)
     except SystemExit:
         raise
     except Exception as e:  # fail open: a hook bug must never block work

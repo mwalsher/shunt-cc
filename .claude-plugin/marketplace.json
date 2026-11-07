@@ -1,15 +1,15 @@
 {
-  "name": "shunt-claude-code",
+  "name": "shunt-cc",
   "description": "Haiku-backed large-file reader for Claude Code: shunt big reads to headless Haiku, keep only the answer.",
   "owner": {
     "name": "mwalsher"
   },
   "plugins": [
     {
-      "name": "shunt-claude-code",
+      "name": "shunt-cc",
       "source": "./",
       "description": "Haiku-backed large-file reader: hooks redirect full reads of large files to a bulk-reader skill backed by headless Claude Code.",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ]
 }

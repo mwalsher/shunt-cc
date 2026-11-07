@@ -1,0 +1,27 @@
+schema_version: "1.1"
+name: full-read-denied
+description: >
+  The user explicitly asks for a full read of a large file. The hook denies it,
+  and the model should recover (bulk-read, or grep plus offset/limit Read) and
+  still answer correctly.
+tags: [behavior, hook]
+runs: 2
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 15
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: >
+    Read inventory_service.py in full, then tell me what RETRY_LIMIT is set to
+    and which method uses it.
+graders:
+  - name: hook-denied-full-read
+    type: regex
+    target: trace
+    pattern: 'shunt: \S*inventory_service\.py is 1261 lines'
+  - name: retry-limit-value
+    type: regex
+    pattern: 'RETRY_LIMIT[^\n]{0,80}\b3\b|\b3\b[^\n]{0,80}RETRY_LIMIT'
+  - name: names-method
+    type: regex
+    pattern: 'call_supplier'

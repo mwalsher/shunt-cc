@@ -1,4 +1,6 @@
 {
+  "license": "Apache-2.0",
+  "notice": "Adapted from spotify/portal-ai-plugins plugins/shunt/evals (Apache-2.0) and modified by mwalsher; see NOTICE for the changes.",
   "description": "Evals for the Bash hook (shunt-hook bash). Adapted from spotify/portal-ai-plugins shunt bash-hook-evals.json, plus rtk, compound-command and recursion cases. `command` is shorthand for input.tool_input.command; `via_rtk` first runs the real `rtk hook claude` and feeds its rewritten command to shunt (skipped if rtk is not installed).",
   "hook_mode": "bash",
   "evals": [
@@ -16,7 +18,6 @@
     { "name": "cat-binary", "command": "cat {{FIXTURES}}/image.bin", "expected_decision": "allow", "reason": "Binary file: not a text read" },
     { "name": "cat-nonexistent", "command": "cat /tmp/shunt-does-not-exist.txt", "expected_decision": "allow", "reason": "Missing file: let Bash report the error" },
     { "name": "cat-directory", "command": "cat {{FIXTURES}}/subdir", "expected_decision": "allow", "reason": "Directory: let Bash report the error" },
-
     { "name": "head-large-file-default", "command": "head {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "CHANGED from shunt: head prints 10 lines, a bounded read like Read+limit" },
     { "name": "head-with-count", "command": "head -100 {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "CHANGED from shunt: 100 lines <= threshold is a bounded read" },
     { "name": "head-n-space-count", "command": "head -n 5 {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "FIXED parser: -n 5 is a count, not a path" },
@@ -31,14 +32,12 @@
     { "name": "tail-reverse", "command": "tail -r {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "BSD tail -r prints the whole file" },
     { "name": "less-large-file", "command": "less {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "less without a TTY dumps the whole file" },
     { "name": "more-large-file", "command": "more {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "more on large file" },
-
     { "name": "cat-pipe", "command": "cat {{FIXTURES}}/large.txt | grep export", "expected_decision": "allow", "reason": "Piped: targeted read" },
     { "name": "cat-redirect", "command": "cat {{FIXTURES}}/large.txt > /tmp/shunt-out.txt", "expected_decision": "allow", "reason": "Redirect: copying, not reading into context" },
     { "name": "cat-append-redirect", "command": "cat {{FIXTURES}}/large.txt >> /tmp/shunt-out.txt", "expected_decision": "allow", "reason": "Append redirect" },
     { "name": "cat-redirect-all", "command": "cat {{FIXTURES}}/large.txt &>/dev/null", "expected_decision": "allow", "reason": "stdout+stderr redirected" },
     { "name": "cat-stderr-redirect-only", "command": "cat {{FIXTURES}}/large.txt 2>/dev/null", "expected_decision": "deny", "reason": "CHANGED from shunt: 2> doesn't divert stdout, the file still lands in context" },
     { "name": "cat-stderr-dup", "command": "cat {{FIXTURES}}/large.txt 2>&1", "expected_decision": "deny", "reason": "2>&1 still prints the file" },
-
     { "name": "compound-and", "command": "echo start && cat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "Reads after && are checked" },
     { "name": "compound-semicolon", "command": "ls; cat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "Reads after ; are checked" },
     { "name": "compound-newline", "command": "echo start\ncat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "Newline-separated commands are checked" },
@@ -54,9 +53,8 @@
     { "name": "grep-command", "command": "grep -n 'export' {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "grep is a targeted search" },
     { "name": "bulk-read-itself", "command": "/plugins/shunt/scripts/bulk-read --question 'what?' --paths {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "The delegation script must not be blocked" },
     { "name": "empty-command", "command": "", "expected_decision": "allow", "reason": "Empty command" },
-    { "name": "missing-command-field", "input": { "tool_input": {} }, "expected_decision": "allow", "reason": "No command field" },
+    { "name": "missing-command-field", "input": {"tool_input": {}}, "expected_decision": "allow", "reason": "No command field" },
     { "name": "unbalanced-quote", "command": "cat '{{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "Unparseable shell fails open" },
-
     { "name": "rtk-read-large", "command": "rtk read {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "rtk read is a full read", "reason_contains": ["`rtk read`"] },
     { "name": "rtk-read-line-numbers", "command": "rtk read -n {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "rtk read -n (rewrite of cat -n)" },
     { "name": "rtk-read-level", "command": "rtk read --level aggressive {{FIXTURES}}/huge.txt", "expected_decision": "deny", "reason": "Filtered but unbounded" },
@@ -73,14 +71,17 @@
     { "name": "rtk-smart", "command": "rtk smart {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "2-line summary" },
     { "name": "rtk-bypass-cat", "command": "rtk bypass cat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "rtk bypass runs the raw cat" },
     { "name": "rtk-bypass-head", "command": "rtk bypass head -50 {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "rtk bypass of a bounded head" },
-
     { "name": "via-rtk-cat-large", "command": "cat {{FIXTURES}}/large.txt", "via_rtk": true, "expected_decision": "deny", "reason": "rtk rewrites to `rtk read`; shunt still denies" },
     { "name": "via-rtk-cat-n-large", "command": "cat -n {{FIXTURES}}/large.txt", "via_rtk": true, "expected_decision": "deny", "reason": "rtk rewrites to `rtk read -n`; shunt still denies" },
     { "name": "via-rtk-head-50", "command": "head -50 {{FIXTURES}}/large.txt", "via_rtk": true, "expected_decision": "allow", "reason": "rtk rewrites to `--head-lines 50`; bounded" },
     { "name": "via-rtk-cat-small", "command": "cat {{FIXTURES}}/small.txt", "via_rtk": true, "expected_decision": "allow", "reason": "Small file after rewrite" },
-
-    { "name": "env-override-lower", "command": "cat {{FIXTURES}}/medium.txt", "env": { "SHUNT_MIN_LINES": "200" }, "expected_decision": "deny", "reason": "SHUNT_MIN_LINES=200: 250 lines denied" },
-    { "name": "recursion-guard-cat", "command": "cat {{FIXTURES}}/huge.txt", "env": { "SHUNT_CHILD": "1" }, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" },
-    { "name": "recursion-guard-rtk", "command": "rtk read {{FIXTURES}}/huge.txt", "env": { "SHUNT_CHILD": "1" }, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" }
+    { "name": "budget-head-then-tail", "prior": [{"command": "head -n 500 {{FIXTURES}}/large.txt"}], "command": "tail -n 400 {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "head 1-500 then tail 801-1200: 900 distinct lines > 600" },
+    { "name": "budget-head-then-tail-from", "prior": [{"command": "head -n 400 {{FIXTURES}}/large.txt"}], "command": "tail -n +700 {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "head 1-400 then lines 700-1200: 901 lines" },
+    { "name": "budget-head-twice", "prior": [{"command": "head -n 500 {{FIXTURES}}/large.txt"}], "command": "head -n 500 {{FIXTURES}}/large.txt", "expected_decision": "allow", "reason": "Same lines twice cost nothing" },
+    { "name": "budget-rtk-paging", "prior": [{"command": "rtk read {{FIXTURES}}/large.txt --head-lines 500"}], "command": "rtk read --tail-lines 500 {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "rtk read head then tail: 1000 lines" },
+    { "name": "budget-shared-with-read", "prior": [{"command": "head -n 500 {{FIXTURES}}/large.txt"}], "command": "tail -n 200 {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "A small tail after a big head still crosses the budget: 700 lines" },
+    { "name": "env-override-lower", "command": "cat {{FIXTURES}}/medium.txt", "env": {"SHUNT_MIN_LINES": "200"}, "expected_decision": "deny", "reason": "SHUNT_MIN_LINES=200: 250 lines denied" },
+    { "name": "recursion-guard-cat", "command": "cat {{FIXTURES}}/huge.txt", "env": {"SHUNT_CHILD": "1"}, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" },
+    { "name": "recursion-guard-rtk", "command": "rtk read {{FIXTURES}}/huge.txt", "env": {"SHUNT_CHILD": "1"}, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" }
   ]
 }

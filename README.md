@@ -1,4 +1,4 @@
-# shunt-claude-code
+# shunt-cc
 
 A minimal Haiku-backed large-file reader for Claude Code. When your session
 tries to read a large file whole, a hook denies it and points the model at the
@@ -27,11 +27,26 @@ takes about 11 seconds.
 ### Hook rules
 
 **Read**: denies a whole-file Read when the file has more than `SHUNT_MIN_LINES`
-lines. It lets through reads with `offset`, `limit` or `pages`, files at or under
-the threshold, missing paths, directories, and binary files (images and PDFs,
-which Read handles natively). The deny reason gives the exact `bulk-read`
-command, and suggests Read with offset/limit when exact text is needed for an
-edit.
+lines. It lets through files at or under the threshold, `pages` reads, missing
+paths, directories, and binary files (images and PDFs, which Read handles
+natively). The deny reason gives the exact `bulk-read` command, and suggests
+Read with offset/limit when exact text is needed for an edit.
+
+**Read budget (large files only)**: reads with `offset`/`limit` pass until they
+would page a large file into context piece by piece. Each large file has a
+budget of `SHUNT_READ_BUDGET` distinct lines per session (default:
+`SHUNT_MIN_LINES`).
+- The budget is per file. Reads across different files never add up, and
+  files at or under `SHUNT_MIN_LINES` are never counted.
+- Re-reading lines you've already read is free, so narrow checks before edits
+  never run out.
+- Bounded Bash reads (`head`, `tail`, `rtk read --head-lines`) of the same file
+  draw on the same budget.
+- `offset` alone reads to Read's 2000-line default, and `offset: 0` or
+  `limit: 0` with no real bound counts as a whole-file read. Those were open
+  bypasses in shunt.
+- The ledger is a JSON file per session under `$TMPDIR/shunt-cc/`. Hook input
+  without a `session_id` gets only the per-read check.
 
 **Bash**: applies the same rule to `cat`, `less`, `more`, `head`, `tail`,
 `rtk read` and `rtk cat`, including:
@@ -74,15 +89,34 @@ claude -p --model claude-haiku-5-5 --effort medium \
   --system-prompt "<terse: structured bullets, names, path:line>" \
   --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --setting-sources "" --disable-slash-commands --no-session-persistence \
-  --output-format json          # file contents go in on stdin
+  --input-format stream-json --output-format stream-json --verbose
 ```
 
-The child runs in an empty temp directory, so it discovers no `CLAUDE.md`, and
-`--setting-sources ""` skips settings, hooks and plugins. Its fixed overhead is
-about 1k tokens. `--bare` would be leaner, but it rejects subscription (OAuth)
-logins, so it isn't used. `bulk-read` fails with a nonzero exit and an error on
-stderr for a missing or binary file, an empty answer, a nonzero exit, an
-`is_error` result, unparseable output, or a timeout (exit 124).
+The message goes in on stdin as one user turn with two content blocks: the
+files, then the question. The child runs in an empty temp directory, so it
+discovers no `CLAUDE.md`, and `--setting-sources ""` skips settings, hooks and
+plugins.
+
+**Token cost.** Headless Claude Code adds a fixed ~940 tokens per call, on
+Haiku and never in your main context. No flag makes this smaller under a
+subscription: `--disable-slash-commands` saves nothing, `--safe-mode` costs
+more, and `--bare` would be leaner but rejects subscription (OAuth) logins. The
+bigger cost is the files themselves, so the files block carries its own
+`cache_control` breakpoint (1h TTL by default). A follow-up question about the
+same paths, in the same order, within the TTL reads the files from cache:
+
+| argparse.py, 2,575 lines | Haiku cost | Time |
+|---|---|---|
+| First question | $0.0083 | 5–11s |
+| Follow-up, different question | $0.00056 | 4s |
+
+The API rejects a 1h breakpoint after a 5m one, and Claude Code picks its own
+TTLs. If the child reports a `cache_control` error, `bulk-read` retries with the
+other TTL, then with no breakpoint.
+
+`bulk-read` fails with a nonzero exit and an error on stderr for a missing or
+binary file, an empty answer, a nonzero exit, an `is_error` result, unparseable
+output, or a timeout (exit 124).
 
 ## Requirements
 
@@ -99,29 +133,29 @@ its bundled binary, so it works there without the CLI installed.
 From GitHub (replace the owner if you fork it):
 
 ```bash
-claude plugin marketplace add mwalsher/shunt-claude-code
+claude plugin marketplace add mwalsher/shunt-cc
 ```
 
 ```bash
-claude plugin install shunt-claude-code@shunt-claude-code
+claude plugin install shunt-cc@shunt-cc
 ```
 
 From a local checkout, in one step:
 
 ```bash
-claude plugin install shunt-claude-code --marketplace /path/to/shunt-claude-code
+claude plugin install shunt-cc --marketplace /path/to/shunt-cc
 ```
 
 To try it for one session without installing:
 
 ```bash
-claude --plugin-dir /path/to/shunt-claude-code
+claude --plugin-dir /path/to/shunt-cc
 ```
 
 Plugins installed at user scope load in both the CLI and the Desktop app's Code
 tab. Start a new session after installing. To stop `bulk-read` from asking for
 Bash permission every time, add an allow rule such as
-`Bash(*/shunt-claude-code/scripts/bulk-read:*)` to your settings.
+`Bash(*/scripts/bulk-read:*)` to your settings.
 
 ## Configuration
 
@@ -130,9 +164,11 @@ Set these in your shell or in `settings.json` under `"env"`.
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
 | `SHUNT_MIN_LINES` | `600` | hooks | Files with more lines than this are denied when read whole. Non-numeric values fall back to the default. |
+| `SHUNT_READ_BUDGET` | `SHUNT_MIN_LINES` | hooks | Distinct lines of one large file that bounded reads may bring into context per session. |
 | `SHUNT_MODEL` | `claude-haiku-5-5` | bulk-read | Model for the child: an alias (`haiku`, `sonnet`) or a full model ID. |
 | `SHUNT_EFFORT` | `medium` | bulk-read | Child effort: `low`, `medium`, `high`, `xhigh` or `max`. |
 | `SHUNT_TIMEOUT` | `300` | bulk-read | Seconds before the child is killed (exit 124). |
+| `SHUNT_CACHE_TTL` | `1h` | bulk-read | Prompt-cache TTL for the files block: `1h`, `5m` or `off`. |
 | `SHUNT_CLAUDE_BIN` | (auto) | bulk-read | Path to the `claude` binary. |
 | `SHUNT_CHILD` | (unset) | both | Set to `1` on the child. Hooks pass everything through and `bulk-read` refuses to run. Don't set it yourself. |
 
@@ -151,29 +187,59 @@ to stderr.
 
 ## Evals
 
+### Hooks and transport (deterministic)
+
 ```bash
 python3 evals/run.py
 ```
 
-This runs 116 cases with no network access or login needed:
+This runs 139 cases with no network access or login needed:
 
-- **Read hook (24)**: adapted from shunt's `hook-evals.json` with a threshold of
+- **Read hook (38)**: adapted from shunt's `hook-evals.json` with a threshold of
   600, plus binary files, directories, `pages`, a file with no trailing newline,
-  malformed input and the recursion guard.
-- **Bash hook (74)**: adapted from shunt's `bash-hook-evals.json`, plus
+  malformed input, the recursion guard, and the read budget: paging, re-reads,
+  overlaps, per-file and per-session scope, and many files in one session.
+- **Bash hook (79)**: adapted from shunt's `bash-hook-evals.json`, plus
   compound commands, `cd`, globs, wrappers, rtk (`rtk read`, `--head-lines`,
-  `rtk bypass`, `rtk cat`), real `rtk hook claude` rewrites, and the recursion
-  guard.
-- **Transport (18)**: `bulk-read` against a stub `claude`. It checks that file
-  contents go on stdin and never in argv, the child flags, `SHUNT_CHILD=1`,
-  model and effort overrides, and every loud-failure path.
+  `rtk bypass`, `rtk cat`), real `rtk hook claude` rewrites, the recursion
+  guard, and head/tail paging against the read budget.
+- **Transport (22)**: `bulk-read` against a stub `claude`. It checks that file
+  contents go on stdin and never in argv, the cached files block and its TTL
+  fallback, the child flags, `SHUNT_CHILD=1`, model and effort overrides, and
+  every loud-failure path.
 
 Where shunt's expected results differ here, the case's `reason` starts with
 CHANGED or FIXED. Bounded `head` and `tail` now pass (they work like Read with a
 limit), `2>/dev/null` no longer exempts a read, and `head -n 5` is parsed as a
-count.
+count. Offset-only and zero offset/limit Reads are now denied (the read
+budget closes those bypasses). Add `-v` to print each deny reason.
 
-Add `-v` to print each deny reason.
+Add `--live` for two real Haiku calls on the generated fixture: a bug-hunt
+question, then a follow-up that must report a cache hit.
+
+### Model behavior (`claude plugin eval`)
+
+```bash
+claude plugin eval . --scaffold --trust-plugin --allow-tools Bash Edit \
+  --model claude-sonnet-5-5 --ablation none --threshold 0.8 --no-publish
+```
+
+Five cases in `evals/<case>/case.yaml` run a real session against a generated
+1,261-line module (`evals/fixtures/make_inventory.py`):
+
+| Case | Checks | Last run (3 runs each) |
+|---|---|---|
+| `overview-large-file` | accurate class overview, no Read of 200+ lines | 100% |
+| `bug-hunt-large-file` | reaches for `bulk-read` unprompted, no paging, finds the planted double-release bug | 89% |
+| `full-read-denied` | an explicit full Read is denied, then answered correctly | 100% |
+| `edit-large-file` | edits via grep or a small Read, never a big chunk | 100% |
+| `small-file-direct` | a 3-line file is read directly, never delegated | 100% |
+
+`claude plugin eval` runs Bash in an OS sandbox where the child `claude` can't
+start, so `bulk-read` fails inside these runs. They measure routing (whether the
+model reaches for the skill, avoids paging, and verifies narrowly) and the
+fallback answer, not Haiku's answer. `--live` above covers the real call. A
+full suite run costs about $1 on Sonnet.
 
 ## Not included
 
@@ -181,5 +247,7 @@ Shunt's `code-write` (delegated code generation) is out of scope for now.
 
 ## License
 
-Apache-2.0. The eval cases are adapted from spotify/portal-ai-plugins
-(Apache-2.0).
+MIT, except `evals/hook-evals.json` and `evals/bash-hook-evals.json`, which
+are adapted from spotify/portal-ai-plugins and stay under Apache-2.0
+([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)). [NOTICE](NOTICE) lists
+the changes.

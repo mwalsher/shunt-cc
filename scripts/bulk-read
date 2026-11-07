@@ -4,12 +4,16 @@
 Usage: bulk-read --question "what does this do?" --paths file1 [file2 ...]
 
 Files go to the child on stdin, wrapped in <file path="..."> tags with line
-numbers. Only the answer is printed; a rough token note goes to stderr.
+numbers, in a prompt-cached block: follow-up questions about the same paths
+within the cache TTL are much cheaper. Only the answer is printed; a rough
+token note goes to stderr.
 """
 import argparse
+import glob
 import html
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -38,14 +42,24 @@ def env_int(name, default):
 
 
 def find_claude():
-    for candidate in (os.environ.get("SHUNT_CLAUDE_BIN"), shutil.which("claude"),
-                      os.environ.get("CLAUDE_CODE_EXECPATH")):
+    # HOME and PATH can be stripped (sandboxes, GUI apps), so also look in the
+    # standard install locations under the real home directory, and in the
+    # newest binary bundled with the Desktop app.
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    bundled = sorted(glob.glob(os.path.join(
+        home, "Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude")),
+        key=os.path.getmtime, reverse=True)
+    for candidate in [os.environ.get("SHUNT_CLAUDE_BIN"), shutil.which("claude"),
+                      os.environ.get("CLAUDE_CODE_EXECPATH"),
+                      os.path.join(home, ".local/bin/claude"),
+                      os.path.join(home, ".claude/local/claude"),
+                      "/opt/homebrew/bin/claude", "/usr/local/bin/claude"] + bundled:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     fail("claude CLI not found; install it or set SHUNT_CLAUDE_BIN")
 
 
-def build_message(question, paths):
+def build_files(paths):
     parts = []
     for path in paths:
         with open(path, "rb") as f:
@@ -56,8 +70,34 @@ def build_message(question, paths):
         numbered = "\n".join("{}\t{}".format(n, line) for n, line in enumerate(lines, 1))
         parts.append('<file path="{}">\n{}\n</file>\n'.format(
             html.escape(path, quote=True), numbered))
-    parts.append("<question>\n{}\n</question>\n".format(question))
     return "\n".join(parts)
+
+
+def user_message(files, question, ttl):
+    """One stream-json user turn: files and question in separate blocks.
+
+    The files block carries its own cache breakpoint, so a follow-up question
+    about the same paths reads the files from the prompt cache instead of
+    paying for them again.
+    """
+    files_block = {"type": "text", "text": files}
+    if ttl != "off":
+        files_block["cache_control"] = {"type": "ephemeral", "ttl": ttl}
+    question_block = {"type": "text", "text": "<question>\n{}\n</question>".format(question)}
+    return json.dumps({"type": "user", "message": {
+        "role": "user", "content": [files_block, question_block]}}) + "\n"
+
+
+def last_result(stdout):
+    result = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    return result
 
 
 def main():
@@ -71,7 +111,7 @@ def main():
     if not args.question.strip():
         fail("--question is empty")
 
-    # A typo'd path would produce a confident answer about nothing.
+    # Check every path up front: Haiku would happily answer about a file it never saw.
     missing = [p for p in args.paths if not (os.path.isfile(p) and os.access(p, os.R_OK))]
     if missing:
         fail("file not found or unreadable: " + ", ".join(missing))
@@ -79,7 +119,10 @@ def main():
     model = os.environ.get("SHUNT_MODEL") or "claude-haiku-5-5"
     effort = os.environ.get("SHUNT_EFFORT") or "medium"
     timeout = env_int("SHUNT_TIMEOUT", 300)
-    message = build_message(args.question, args.paths)
+    ttl = os.environ.get("SHUNT_CACHE_TTL") or "1h"
+    if ttl not in ("1h", "5m", "off"):
+        fail("SHUNT_CACHE_TTL must be 1h, 5m or off")
+    files = build_files(args.paths)
 
     cmd = [
         find_claude(), "-p",
@@ -91,27 +134,31 @@ def main():
         "--setting-sources", "",
         "--disable-slash-commands",
         "--no-session-persistence",
-        "--output-format", "json",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json", "--verbose",
     ]
     env = dict(os.environ, SHUNT_CHILD="1")
     env.pop("CLAUDE_EFFORT", None)  # the parent session's effort must not override --effort
 
+    # The API rejects a 1h breakpoint after a 5m one, and Claude Code picks its
+    # own TTL, so on a TTL error retry with the other TTL, then with none.
+    ttls = [ttl] + [t for t in ("1h", "5m", "off") if t != ttl and ttl != "off"]
     started = time.time()
     # Run from an empty directory so the child discovers no project CLAUDE.md.
     with tempfile.TemporaryDirectory(prefix="shunt-") as cwd:
-        try:
-            proc = subprocess.run(cmd, input=message, capture_output=True, text=True,
-                                  cwd=cwd, env=env, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            fail("{} timed out after {}s (raise SHUNT_TIMEOUT)".format(model, timeout), 124)
+        for attempt in ttls:
+            try:
+                proc = subprocess.run(cmd, input=user_message(files, args.question, attempt),
+                                      capture_output=True, text=True, cwd=cwd, env=env,
+                                      timeout=timeout)
+            except subprocess.TimeoutExpired:
+                fail("{} timed out after {}s (raise SHUNT_TIMEOUT)".format(model, timeout), 124)
+            result = last_result(proc.stdout)
+            answer = (result.get("result") or "").strip()
+            if not (result.get("is_error") and "cache_control" in answer):
+                break
 
     stderr_tail = proc.stderr.strip()[-2000:]
-    try:
-        result = json.loads(proc.stdout)
-    except ValueError:
-        result = {}
-    answer = (result.get("result") or "").strip() if isinstance(result, dict) else ""
-
     if proc.returncode != 0:
         fail("claude exited {}: {}".format(proc.returncode, answer or stderr_tail or proc.stdout.strip()[-2000:]))
     if result.get("is_error") or result.get("subtype", "success") != "success":
@@ -120,10 +167,10 @@ def main():
         fail("{} returned an empty answer{}".format(model, ": " + stderr_tail if stderr_tail else ""))
 
     print(answer)
-    print("[shunt: ~{} input tokens ({} files) -> {} ({}), {:.0f}s]".format(
-        len(message) // 4, len(args.paths), model, effort, time.time() - started),
-        file=sys.stderr)
-
+    cached = (result.get("usage") or {}).get("cache_read_input_tokens") or 0
+    print("[shunt: ~{} input tokens ({} files{}) -> {} ({}), {:.0f}s]".format(
+        len(files) // 4, len(args.paths), ", cache hit" if cached > 1000 else "",
+        model, effort, time.time() - started), file=sys.stderr)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,39 @@
+schema_version: "1.1"
+name: overview-large-file
+description: >
+  Survey question about a 1,261-line file without naming the skill. Class
+  names and docstrings are grep-able, so grep plus a few targeted reads is an
+  acceptable, cheap path; so is bulk-read. Paging through the whole file with
+  offset/limit, or hedged guesses from names, is not.
+tags: [behavior, skill-trigger]
+runs: 2
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 15
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: >
+    Give me an overview of inventory_service.py: its main classes, what each
+    one is responsible for, and the line where each starts.
+graders:
+  - name: no-paging
+    # Reading the file in big chunks defeats the point: no Read of 200+ lines.
+    type: tool_used
+    tool: Read
+    input_match: '"limit":\s*(\d{4,}|[2-9]\d{2})'
+    min: 0
+    max: 0
+    arm: both
+  - name: names-classes
+    type: regex
+    pattern: 'WarehouseRegistry[\s\S]*SupplierGateway[\s\S]*BillingEngine[\s\S]*AuditTrail'
+  - name: accurate
+    type: llm
+    criteria: >
+      The answer lists the seven classes WarehouseRegistry (line 8),
+      StockLedger (183), ReservationManager (366), ReplenishmentPlanner (550),
+      SupplierGateway (725), BillingEngine (908) and AuditTrail (1088), with a
+      responsibility for each. Responsibilities taken from the class
+      docstrings count as grounded. Fail only if a class is missing, a
+      responsibility contradicts the file, or a line number is off by more
+      than 2. Extra accurate detail is fine.

@@ -1,0 +1,30 @@
+{
+  "description": "Evals for the Read hook (shunt-hook read). Adapted from spotify/portal-ai-plugins shunt hook-evals.json; threshold default is 600 here.",
+  "hook_mode": "read",
+  "evals": [
+    { "name": "small-file", "input": { "tool_input": { "file_path": "{{FIXTURES}}/small.txt" } }, "expected_decision": "allow", "reason": "Under threshold: delegation overhead not worth it" },
+    { "name": "boundary-exact-600", "input": { "tool_input": { "file_path": "{{FIXTURES}}/boundary.txt" } }, "expected_decision": "allow", "reason": "Exactly at threshold (<=600): allow" },
+    { "name": "just-over-threshold", "input": { "tool_input": { "file_path": "{{FIXTURES}}/over.txt" } }, "expected_decision": "deny", "reason": "One line over threshold: deny" },
+    { "name": "over-no-trailing-newline", "input": { "tool_input": { "file_path": "{{FIXTURES}}/over-no-newline.txt" } }, "expected_decision": "deny", "reason": "601 lines without final newline counts as 601, like Read does (wc -l says 600)" },
+    { "name": "large-file", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt" } }, "expected_decision": "deny", "reason": "Well over threshold", "reason_contains": ["bulk-read", "bulk-reader", "offset/limit", "1200 lines"] },
+    { "name": "very-large-file", "input": { "tool_input": { "file_path": "{{FIXTURES}}/huge.txt" } }, "expected_decision": "deny", "reason": "Very large file" },
+    { "name": "path-with-space", "input": { "tool_input": { "file_path": "{{FIXTURES}}/dir with space/large.txt" } }, "expected_decision": "deny", "reason": "Spaces in path are handled" },
+    { "name": "empty-file", "input": { "tool_input": { "file_path": "{{FIXTURES}}/empty.txt" } }, "expected_decision": "allow", "reason": "Empty file: nothing to delegate" },
+    { "name": "targeted-read-offset", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "offset": 100 } }, "expected_decision": "allow", "reason": "Offset set: targeted read" },
+    { "name": "targeted-read-limit", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "limit": 50 } }, "expected_decision": "allow", "reason": "Limit set: targeted read" },
+    { "name": "targeted-read-both", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "offset": 100, "limit": 50 } }, "expected_decision": "allow", "reason": "Offset and limit: targeted read" },
+    { "name": "offset-zero", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "offset": 0 } }, "expected_decision": "allow", "reason": "offset:0 treated as targeted (known bypass, kept from shunt)" },
+    { "name": "limit-zero", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "limit": 0 } }, "expected_decision": "allow", "reason": "limit:0 treated as targeted (known bypass, kept from shunt)" },
+    { "name": "pdf-pages", "input": { "tool_input": { "file_path": "{{FIXTURES}}/large.txt", "pages": "1-3" } }, "expected_decision": "allow", "reason": "Page range is a targeted read" },
+    { "name": "nonexistent-file", "input": { "tool_input": { "file_path": "/tmp/shunt-does-not-exist.txt" } }, "expected_decision": "allow", "reason": "Missing path: let Read report the error" },
+    { "name": "directory", "input": { "tool_input": { "file_path": "{{FIXTURES}}/subdir" } }, "expected_decision": "allow", "reason": "Directory: let Read report the error" },
+    { "name": "binary-file", "input": { "tool_input": { "file_path": "{{FIXTURES}}/image.bin" } }, "expected_decision": "allow", "reason": "Binary (images, PDFs): Read handles these natively" },
+    { "name": "empty-filepath", "input": { "tool_input": { "file_path": "" } }, "expected_decision": "allow", "reason": "Empty path: pass through" },
+    { "name": "missing-filepath-field", "input": { "tool_input": {} }, "expected_decision": "allow", "reason": "No file_path: pass through" },
+    { "name": "malformed-json", "raw_input": "{not json", "expected_decision": "allow", "reason": "Unparseable input fails open" },
+    { "name": "env-override-lower", "input": { "tool_input": { "file_path": "{{FIXTURES}}/medium.txt" } }, "env": { "SHUNT_MIN_LINES": "200" }, "expected_decision": "deny", "reason": "SHUNT_MIN_LINES=200: 250-line file denied" },
+    { "name": "env-override-higher", "input": { "tool_input": { "file_path": "{{FIXTURES}}/over.txt" } }, "env": { "SHUNT_MIN_LINES": "700" }, "expected_decision": "allow", "reason": "SHUNT_MIN_LINES=700: 601-line file allowed" },
+    { "name": "env-non-numeric-fallback", "input": { "tool_input": { "file_path": "{{FIXTURES}}/over.txt" } }, "env": { "SHUNT_MIN_LINES": "abc" }, "expected_decision": "deny", "reason": "Non-numeric SHUNT_MIN_LINES falls back to 600" },
+    { "name": "recursion-guard", "input": { "tool_input": { "file_path": "{{FIXTURES}}/huge.txt" } }, "env": { "SHUNT_CHILD": "1" }, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" }
+  ]
+}

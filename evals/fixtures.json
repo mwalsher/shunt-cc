@@ -1,0 +1,16 @@
+{
+  "description": "Files generated under {{FIXTURES}} before each suite. A number is a line count; objects allow options.",
+  "fixtures": {
+    "empty.txt": 0,
+    "small.txt": 100,
+    "medium.txt": 250,
+    "boundary.txt": 600,
+    "over.txt": 601,
+    "over-no-newline.txt": { "lines": 601, "trailing_newline": false },
+    "large.txt": 1200,
+    "huge.txt": 5000,
+    "dir with space/large.txt": 1200,
+    "image.bin": { "binary": true },
+    "subdir/": null
+  }
+}

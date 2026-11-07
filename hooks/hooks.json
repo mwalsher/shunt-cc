@@ -1,0 +1,27 @@
+{
+  "description": "Deny full reads of large files and redirect them to the bulk-reader skill",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/shunt-hook\" read",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/shunt-hook\" bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

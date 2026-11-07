@@ -1,0 +1,17 @@
+{
+  "name": "shunt-claude-code",
+  "displayName": "Shunt for Claude Code",
+  "version": "0.1.0",
+  "description": "Saves main-model tokens by sending large file reads to Haiku through headless Claude Code. Hooks deny full reads of large files and redirect to the bulk-reader skill; only Haiku's answer enters your context.",
+  "author": {
+    "name": "mwalsher"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "token-optimization",
+    "model-routing",
+    "delegation",
+    "haiku",
+    "large-files"
+  ]
+}

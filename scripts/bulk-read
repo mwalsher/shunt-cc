@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Ask Haiku a question about large files via headless Claude Code.
+
+Usage: bulk-read --question "what does this do?" --paths file1 [file2 ...]
+
+Files go to the child on stdin, wrapped in <file path="..."> tags with line
+numbers. Only the answer is printed; a rough token note goes to stderr.
+"""
+import argparse
+import html
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+SYSTEM_PROMPT = (
+    "You answer one question about the files given in <file path=\"...\"> tags. "
+    "Every file line is prefixed with its line number and a tab; cite those numbers. "
+    "Answer only from the files. Reply in terse structured bullets: name the "
+    "relevant functions, classes, keys or symbols and give path:line or "
+    "path:start-end for each. Quote code only when the exact text matters, and "
+    "keep quotes short. If the files do not answer the question, say so. "
+    "No preamble, no closing summary."
+)
+
+
+def fail(msg, code=1):
+    print("bulk-read: error: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def env_int(name, default):
+    raw = os.environ.get(name, "")
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+def find_claude():
+    for candidate in (os.environ.get("SHUNT_CLAUDE_BIN"), shutil.which("claude"),
+                      os.environ.get("CLAUDE_CODE_EXECPATH")):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    fail("claude CLI not found; install it or set SHUNT_CLAUDE_BIN")
+
+
+def build_message(question, paths):
+    parts = []
+    for path in paths:
+        with open(path, "rb") as f:
+            data = f.read()
+        if b"\0" in data[:8192]:
+            fail("binary file, not sending: " + path)
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        numbered = "\n".join("{}\t{}".format(n, line) for n, line in enumerate(lines, 1))
+        parts.append('<file path="{}">\n{}\n</file>\n'.format(
+            html.escape(path, quote=True), numbered))
+    parts.append("<question>\n{}\n</question>\n".format(question))
+    return "\n".join(parts)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--question", required=True)
+    parser.add_argument("--paths", required=True, nargs="+")
+    args = parser.parse_args()
+
+    if os.environ.get("SHUNT_CHILD"):
+        fail("refusing to run inside a shunt child (SHUNT_CHILD is set)")
+    if not args.question.strip():
+        fail("--question is empty")
+
+    # A typo'd path would produce a confident answer about nothing.
+    missing = [p for p in args.paths if not (os.path.isfile(p) and os.access(p, os.R_OK))]
+    if missing:
+        fail("file not found or unreadable: " + ", ".join(missing))
+
+    model = os.environ.get("SHUNT_MODEL") or "claude-haiku-5-5"
+    effort = os.environ.get("SHUNT_EFFORT") or "medium"
+    timeout = env_int("SHUNT_TIMEOUT", 300)
+    message = build_message(args.question, args.paths)
+
+    cmd = [
+        find_claude(), "-p",
+        "--model", model,
+        "--effort", effort,
+        "--system-prompt", SYSTEM_PROMPT,
+        "--tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format", "json",
+    ]
+    env = dict(os.environ, SHUNT_CHILD="1")
+    env.pop("CLAUDE_EFFORT", None)  # the parent session's effort must not override --effort
+
+    started = time.time()
+    # Run from an empty directory so the child discovers no project CLAUDE.md.
+    with tempfile.TemporaryDirectory(prefix="shunt-") as cwd:
+        try:
+            proc = subprocess.run(cmd, input=message, capture_output=True, text=True,
+                                  cwd=cwd, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            fail("{} timed out after {}s (raise SHUNT_TIMEOUT)".format(model, timeout), 124)
+
+    stderr_tail = proc.stderr.strip()[-2000:]
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        result = {}
+    answer = (result.get("result") or "").strip() if isinstance(result, dict) else ""
+
+    if proc.returncode != 0:
+        fail("claude exited {}: {}".format(proc.returncode, answer or stderr_tail or proc.stdout.strip()[-2000:]))
+    if result.get("is_error") or result.get("subtype", "success") != "success":
+        fail("{} returned an error ({}): {}".format(model, result.get("subtype"), answer or stderr_tail))
+    if not answer:
+        fail("{} returned an empty answer{}".format(model, ": " + stderr_tail if stderr_tail else ""))
+
+    print(answer)
+    print("[shunt: ~{} input tokens ({} files) -> {} ({}), {:.0f}s]".format(
+        len(message) // 4, len(args.paths), model, effort, time.time() - started),
+        file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

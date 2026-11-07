@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: deny full reads of large files and point at bulk-reader.
+
+Usage (from hooks.json):
+  shunt-hook read   # Read tool
+  shunt-hook bash   # Bash tool: cat/head/tail/less/more/rtk read
+
+Prints nothing to pass through (the normal permission flow decides), or a
+hookSpecificOutput deny with a reason. Never emits "allow": that would skip the
+user's permission prompts. Any internal error passes through (fails open).
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import sys
+
+DEFAULT_MIN_LINES = 600
+SEPARATORS = {";", "&&", "||", "&", "\n", ";;", "(", ")"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def min_lines():
+    raw = os.environ.get("SHUNT_MIN_LINES", "")
+    return int(raw) if raw.isdigit() else DEFAULT_MIN_LINES
+
+
+def count_lines(path):
+    """Line count as the Read tool sees it, or None for binary/unreadable files."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+            if b"\0" in head:
+                return None
+            n, last, chunk = head.count(b"\n"), head[-1:], head
+            while chunk:
+                chunk = f.read(1 << 20)
+                if chunk:
+                    n += chunk.count(b"\n")
+                    last = chunk[-1:]
+    except OSError:
+        return None
+    return n + (1 if last and last != b"\n" else 0)
+
+
+def bulk_read_cmd(path):
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    return '{}/scripts/bulk-read --question "<your question>" --paths {}'.format(
+        root, shlex.quote(path))
+
+
+def deny(reason):
+    json.dump({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}, sys.stdout)
+    sys.exit(0)
+
+
+# ── Read tool ────────────────────────────────────────────────────────────────
+
+def check_read(tool_input):
+    # Targeted reads (offset/limit, even 0) and PDF page ranges pass through.
+    if any(k in tool_input for k in ("offset", "limit", "pages")):
+        return
+    path = tool_input.get("file_path") or ""
+    if not path or not os.path.isfile(path):
+        return
+    lines, threshold = count_lines(path), min_lines()
+    if lines is None or lines <= threshold:
+        return
+    deny(
+        "shunt: {} is {} lines (SHUNT_MIN_LINES={}), too large to read whole. "
+        "To understand, summarize or search it, use the bulk-reader skill, which "
+        "sends the file to Haiku and returns only the answer:\n  {}\n"
+        "If you need exact content for an edit, Read it again with offset/limit "
+        "for just the section you need (grep -n can find it first).".format(
+            path, lines, threshold, bulk_read_cmd(path)))
+
+
+# ── Bash tool ────────────────────────────────────────────────────────────────
+
+def tokenize(command):
+    lex = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    return list(lex)
+
+
+def split_commands(tokens):
+    """Split on ;, &&, ||, &, newline. Yields (words, piped) per pipeline."""
+    current = []
+    for tok in tokens + [";"]:
+        if tok in SEPARATORS or (set(tok) <= set(";&\n") and tok):
+            if current:
+                yield current, any(t in ("|", "|&") for t in current)
+            current = []
+        else:
+            current.append(tok)
+
+
+def strip_redirects(words):
+    """Return (words, stdin_files, stdout_redirected)."""
+    out, stdin_files, redirected, i = [], [], False, 0
+    while i < len(words):
+        tok = words[i]
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        if tok in (">", ">>", ">|"):
+            if out and out[-1].isdigit() and out[-1] != "1":
+                out.pop()  # 2>/dev/null etc: stderr still lands in context
+            else:
+                if out and out[-1] == "1":
+                    out.pop()
+                redirected = True
+            i += 2
+        elif tok in ("&>", "&>>"):
+            redirected = True
+            i += 2
+        elif tok in (">&", "<&"):
+            if out and out[-1].isdigit():
+                out.pop()
+            i += 2
+        elif tok == "<":
+            if nxt:
+                stdin_files.append(nxt)
+            i += 2
+        elif tok in ("<<", "<<<", "<<-"):
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return out, stdin_files, redirected
+
+
+def unwrap(words):
+    """Drop env assignments and transparent wrappers (env, command, rtk bypass…)."""
+    while words:
+        if ASSIGNMENT.match(words[0]):
+            words = words[1:]
+        elif words[0] in ("command", "builtin", "exec", "nohup", "time", "sudo"):
+            words = words[1:]
+        elif words[0] == "env":
+            words = words[1:]
+            while words and (words[0].startswith("-") or ASSIGNMENT.match(words[0])):
+                words = words[1:]
+        elif os.path.basename(words[0]) == "rtk" and len(words) > 1 and words[1] in ("bypass", "proxy"):
+            words = words[2:]
+        else:
+            return words
+    return words
+
+
+def parse_count(value):
+    """'50' -> 50, '+10' -> ('from', 10), '-5' -> ('allbut', 5); None if unparseable."""
+    m = re.match(r"^([+-]?)(\d+)", value or "")
+    if not m:
+        return None
+    n = int(m.group(2))
+    return {"+": ("from", n), "-": ("allbut", n)}.get(m.group(1), n)
+
+
+def head_tail(name, args):
+    """Return (files, emit) where emit(total) is the number of lines printed."""
+    count, files, whole, i = 10, [], False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            files += args[i + 1:]
+            break
+        if a in ("-n", "--lines") and i + 1 < len(args):
+            count = parse_count(args[i + 1])
+            i += 2
+            continue
+        if a in ("-c", "--bytes") or a.startswith(("-c", "--bytes=")):
+            return [], None  # byte ranges are bounded; not a line read
+        if a.startswith("--lines="):
+            count = parse_count(a.split("=", 1)[1])
+        elif re.match(r"^-n[+-]?\d", a):
+            count = parse_count(a[2:])
+        elif re.match(r"^-\d", a) or (name == "tail" and re.match(r"^\+\d", a)):
+            count = parse_count(a if a.startswith("+") else a[1:])
+        elif a == "-r" and name == "tail":
+            whole = True  # BSD tail -r prints the whole file reversed by default
+        elif not a.startswith("-") or a == "-":
+            files.append(a)
+        i += 1
+
+    explicit = count != 10
+
+    def emit(total):
+        if whole and not explicit:
+            return total
+        if count is None:
+            return total
+        if isinstance(count, tuple):
+            kind, n = count
+            if kind == "from":  # tail -n +K: line K to end; head -n +K == K
+                return max(total - n + 1, 0) if name == "tail" else min(n, total)
+            return max(total - n, 0) if name == "head" else min(n, total)
+        return min(count, total)
+
+    return files, emit
+
+
+def rtk_read(args):
+    bound, files, i = None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-l", "--level"):
+            i += 2
+            continue
+        if a in ("-m", "--max-lines", "--head-lines", "--tail-lines") and i + 1 < len(args):
+            n = parse_count(args[i + 1])
+            bound = n if isinstance(n, int) else bound
+            i += 2
+            continue
+        m = re.match(r"^--(max-lines|head-lines|tail-lines)=(\d+)$", a)
+        if m:
+            bound = int(m.group(2))
+        elif not a.startswith("-"):
+            files.append(a)
+        i += 1
+    return files, (lambda total: total if bound is None else min(bound, total))
+
+
+def full(args):
+    files, rest = [], False
+    for a in args:
+        if rest or (not a.startswith(("-", "+")) and a != "-"):
+            files.append(a)
+        elif a == "--":
+            rest = True
+    return files, (lambda total: total)
+
+
+def read_targets(words):
+    """Map a simple command to (verb, files, emit) or None if it isn't a file read."""
+    words = unwrap(words)
+    if not words:
+        return None
+    name, args = os.path.basename(words[0]), words[1:]
+    if name in ("cat", "less", "more"):
+        return (name,) + full(args)
+    if name in ("head", "tail"):
+        files, emit = head_tail(name, args)
+        return (name, files, emit) if emit else None
+    if name == "rtk" and args and args[0] in ("read", "cat"):
+        return ("rtk " + args[0],) + rtk_read(args[1:])
+    return None
+
+
+def resolve(path, cwd):
+    path = os.path.expandvars(os.path.expanduser(path))
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    if any(c in path for c in "*?["):
+        return sorted(glob.glob(path))
+    return [path]
+
+
+def check_bash(tool_input, cwd):
+    command = tool_input.get("command") or ""
+    if not command.strip():
+        return
+    threshold = min_lines()
+    for words, piped in split_commands(tokenize(command)):
+        words, stdin_files, redirected = strip_redirects(words)
+        unwrapped = unwrap(words)
+        if unwrapped[:1] == ["cd"]:
+            target = unwrapped[1] if len(unwrapped) > 1 else "~"
+            if target != "-":
+                cwd = (resolve(target, cwd) or [cwd])[0]
+            continue
+        if piped or redirected:
+            continue
+        target = read_targets(words)
+        if not target:
+            continue
+        verb, files, emit = target
+        files = files or stdin_files
+        for f in files:
+            for path in resolve(f, cwd):
+                if not os.path.isfile(path):
+                    continue
+                total = count_lines(path)
+                if total is None or emit(total) <= threshold:
+                    continue
+                deny(
+                    "shunt: {} is {} lines (SHUNT_MIN_LINES={}); `{}` would put {} "
+                    "lines into context. To understand, summarize or search it, use "
+                    "the bulk-reader skill, which sends the file to Haiku and returns "
+                    "only the answer:\n  {}\n"
+                    "If you need exact content for an edit, use the Read tool with "
+                    "offset/limit for just the section you need (grep -n can find "
+                    "it first).".format(path, total, threshold, verb, emit(total),
+                                        bulk_read_cmd(path)))
+
+
+def main():
+    if os.environ.get("SHUNT_CHILD"):
+        return  # recursion guard: never interfere inside a shunt child
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        payload = json.load(sys.stdin)
+        tool_input = payload.get("tool_input") or {}
+        if mode == "read":
+            check_read(tool_input)
+        elif mode == "bash":
+            check_bash(tool_input, payload.get("cwd") or os.getcwd())
+    except SystemExit:
+        raise
+    except Exception as e:  # fail open: a hook bug must never block work
+        print("shunt-hook: {}: {}".format(type(e).__name__, e), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

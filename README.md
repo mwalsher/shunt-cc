@@ -7,9 +7,9 @@ Code (`claude -p`) and returns only Haiku's answer, so the file contents never
 enter your main context.
 
 Inspired by Spotify's [shunt](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt)
-plugin. Where shunt delegates to AiKA through the Portal CLI, this plugin uses
-your own Claude Code login, so it runs on a Claude subscription. It needs no API
-key, proxy or third-party service.
+plugin. Where shunt delegates to a model behind its own platform's tooling,
+this plugin uses your own Claude Code login, so it runs on a Claude
+subscription. It needs no API key, proxy or third-party service.
 
 Example: a 2,575-line file is about 27k tokens. Through `bulk-read`, a
 structured answer with line numbers costs the main model about 700 tokens and

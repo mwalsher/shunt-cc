@@ -11,6 +11,7 @@ a stub claude.
 import json
 import re
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -64,6 +65,7 @@ def hook_env(extra):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("SHUNT_") and k != "CLAUDE_CODE_SESSION_ID"}
     env["SHUNT_STATE_DIR"] = STATE
+    env["SHUNT_PRICES"] = "off"  # the suite never fetches the pricing page; price cases opt back in
     env.update(extra or {})
     return env
 
@@ -380,9 +382,16 @@ def run_ledger_suite():
         subprocess.run([sys.executable, os.path.join(EVALS, "fixtures", "make_inventory.py"), big], check=True)
         env = hook_env({"SHUNT_STATE_DIR": state, "TMPDIR": tmp})
 
+        # A transcript as Claude Code writes it: the main model is on each assistant message.
+        transcript = os.path.join(tmp, "transcript.jsonl")
+        with open(transcript, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-5", "content": []}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": "model"}}) + "\n")
+
         def hook(tool_input, session="eval-ledger"):
             payload = {"hook_event_name": "PreToolUse", "tool_name": "Read", "session_id": session,
-                       "cwd": tmp, "tool_input": tool_input}
+                       "cwd": tmp, "transcript_path": transcript, "tool_input": tool_input}
             return subprocess.run([HOOK, "read"], input=json.dumps(payload), capture_output=True,
                                   text=True, env=env)
 
@@ -392,9 +401,14 @@ def run_ledger_suite():
         events = read_log(state)
         deny = [e for e in events if e["event"] == "deny"]
         reads = [e for e in events if e["event"] == "read"]
-        report(len(deny) == 1 and deny[0]["kind"] == "whole" and deny[0]["outline"] and deny[0]["tokens"] > 100,
-               "logs-deny", "a deny is logged with its kind and the tokens its message costs")
-        report([r["lines"] for r in reads] == [20, 5] and all(r["tokens"] > 0 for r in reads),
+        report(len(deny) == 1 and deny[0]["kind"] == "whole" and deny[0]["outline"] and deny[0]["tokens"] > 100
+               and deny[0].get("file_tokens", 0) > 5000 and bool(deny[0].get("cwd"))
+               and deny[0].get("model") == "claude-opus-5-5",
+               "logs-deny", "a deny is logged with its kind, its message's tokens, the file's size, the cwd "
+               "and the latest main model from the transcript")
+        report([r["lines"] for r in reads] == [20, 5] and all(r["tokens"] > 0 for r in reads)
+               and all(r.get("file_tokens") == deny[0].get("file_tokens") for r in reads)
+               and all(r.get("model") == "claude-opus-5-5" for r in reads),
                "logs-new-lines-only", "bounded reads of a large file log only lines not read before")
 
         tog = lambda action, session="eval-ledger": subprocess.run(
@@ -432,6 +446,13 @@ def run_ledger_suite():
              "error": "timeout", "child": {"cost_usd": 0.0}},
             {"ts": now - 3000, "event": "deny", "session": "s2", "path": "/b.py", "kind": "budget", "tokens": 400},
             {"ts": now - 2900, "event": "read", "session": "s2", "path": "/b.py", "lines": 40, "tokens": 999},
+            # Routing: a denied file read in ranges, and one read in ranges with no deny.
+            {"ts": now - 2800, "event": "deny", "session": "s3", "cwd": "/proj2", "path": "/c.py", "kind": "whole",
+             "tokens": 700, "file_tokens": 12000, "model": "claude-sonnet-5-5"},
+            {"ts": now - 2700, "event": "read", "session": "s3", "path": "/c.py", "lines": 30, "tokens": 300,
+             "file_tokens": 12000},
+            {"ts": now - 2600, "event": "read", "session": "s3", "path": "/d.py", "lines": 20, "tokens": 200,
+             "file_tokens": 8000},
         ]
         rstate = os.path.join(tmp, "report-state")
         os.makedirs(rstate)
@@ -444,20 +465,160 @@ def run_ledger_suite():
             g = json.loads(p.stdout)["groups"]["all"]
         except (ValueError, KeyError):
             g = {}
-        want = {"calls": 2, "failed": 1, "kept_out": 40000, "answers": 600, "deny_tokens": 900,
-                "list_tokens": 100, "followup_tokens": 300, "brought_back": 1900, "net": 38100,
-                "cache_hits": 1, "cited": 8, "cited_ok": 6, "cited_unchecked": 1, "denied_files": 2, "denied_without_haiku": 1}
+        want = {"calls": 2, "failed": 1, "kept_out": 40000, "answers": 600, "deny_tokens": 1600,
+                "list_tokens": 100, "followup_tokens": 300, "routed_files": 2, "routed_sessions": 1,
+                "routed_out": 20000, "routed_reads": 500, "unsized_files": 1, "brought_back": 3100, "net": 56900,
+                "cache_hits": 1, "cited": 8, "cited_ok": 6, "cited_unchecked": 1, "denied_files": 3, "denied_without_haiku": 2}
         wrong = {k: g.get(k) for k, v in want.items() if g.get(k) != v}
-        money = abs(g.get("haiku_usd", 0) - 0.005) < 1e-9 and abs(g.get("saved_usd", 0) - (38100 * 2.0 / 1e6 - 0.005)) < 1e-9
-        report(not wrong and money, "report-totals", "period filter, net tokens, follow-up reads, Haiku cost, saving"
+        money = abs(g.get("haiku_usd", 0) - 0.005) < 1e-9 and abs(g.get("saved_usd", 0) - (56900 * 2.0 / 1e6 - 0.005)) < 1e-9
+        report(not wrong and money, "report-totals", "period filter, routing and delegation tokens, narrow and "
+               "follow-up reads, unsized old lines, Haiku cost, saving"
                if not wrong and money else "wrong: {} money_ok={} stderr={}".format(wrong, money, p.stderr[-200:]))
+        p = subprocess.run([REPORT, "--since", "7d", "--json"], capture_output=True, text=True, env=renv)
+        try:
+            g = json.loads(p.stdout)["groups"]["all"]
+        except (ValueError, KeyError):
+            g = {}
+        # s3 ran on sonnet (net 18,800 tokens at $2); s1 and s2 logged no model (net 38,100 at opus, $4).
+        want_usd = (38100 * 4.0 + 18800 * 2.0) / 1e6
+        ok = abs(g.get("main_usd", 0) - want_usd) < 1e-9 and g.get("priced_as") == {"unknown": 2, "claude-sonnet-5-5": 1}
+        report(ok, "report-per-model", "each session priced by its logged model; unlogged ones at opus"
+               if ok else "main_usd={} priced_as={}".format(g.get("main_usd"), g.get("priced_as")))
+        p = subprocess.run([REPORT, "--since", "7d"], capture_output=True, text=True, env=renv)
+        report("priced by session model: claude-sonnet-5-5 1, no logged model (as claude-opus-5-5) 2" in p.stdout, "report-per-model-text",
+               "the text report says how sessions were priced")
+        # List prices: parsed from the pricing page (a local copy here), cached, with fallbacks.
+        page = os.path.join(tmp, "pricing.md")
+
+        def write_page(sonnet):
+            with open(page, "w") as f:
+                f.write("# Pricing\n\n## Model pricing\n\n| Model | Base input tokens | Output tokens |\n| :-- | :-- | :-- |\n"
+                        "| Claude Fable 5.1 | $10 / MTok | $50 / MTok |\n"
+                        "| Claude Mythos 5.1 ([limited availability](https://example.com)) | $10 / MTok | $50 / MTok |\n"
+                        "| Claude Opus 5.5 | $4 / MTok | $20 / MTok |\n"
+                        "| Claude Opus 5 | $5 / MTok | $25 / MTok |\n"
+                        "| Claude Sonnet 5.5 | ${} / MTok | $10 / MTok |\n"
+                        "| Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.50 / MTok |\n"
+                        "| Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $2.50 / MTok |\n"
+                        "\n## Batch processing\n\n| Claude Opus 5.5 | $2 / MTok | $10 / MTok |\n".format(sonnet))
+
+        def priced(extra, state_dir):
+            e = hook_env(dict({"SHUNT_STATE_DIR": state_dir, "SHUNT_PRICES": ""}, **extra))
+            os.makedirs(state_dir, exist_ok=True)
+            shutil.copy(os.path.join(rstate, "usage.jsonl"), os.path.join(state_dir, "usage.jsonl"))
+            p = subprocess.run([REPORT, "--since", "7d", "--json"], capture_output=True, text=True, env=e)
+            try:
+                return json.loads(p.stdout)
+            except ValueError:
+                return {"stderr": p.stderr[-300:]}
+
+        url = pathlib.Path(page).as_uri()
+        write_page(3)
+        pstate = os.path.join(tmp, "price-state")
+        j = priced({"SHUNT_PRICES_URL": url}, pstate)
+        g = j.get("groups", {}).get("all", {})
+        ok = (j.get("prices", {}).get("claude-sonnet-5-5") == 3.0 and j.get("prices", {}).get("claude-haiku-5-5") == 0.10
+              and j.get("prices", {}).get("claude-mythos-5-1") == 10.0 and "fetched" in (j.get("prices_source") or "")
+              and abs(g.get("main_usd", 0) - (38100 * 4.0 + 18800 * 3.0) / 1e6) < 1e-9)
+        report(ok, "prices-from-page", "list prices parsed from the page's model table (lower Haiku tier, "
+               "later tables ignored) and used per session" if ok else "got {}".format({k: j.get(k) for k in ("prices", "prices_source", "stderr")}))
+        write_page(9)
+        j = priced({"SHUNT_PRICES_URL": url}, pstate)
+        report(j.get("prices", {}).get("claude-sonnet-5-5") == 3.0, "prices-cached",
+               "a second report within a day uses the cached prices, not the page")
+        with open(os.path.join(pstate, "prices.json")) as f:
+            cache = json.load(f)
+        cache["fetched"] -= 2 * 86400
+        with open(os.path.join(pstate, "prices.json"), "w") as f:
+            json.dump(cache, f)
+        j = priced({"SHUNT_PRICES_URL": url}, pstate)
+        report(j.get("prices", {}).get("claude-sonnet-5-5") == 9.0, "prices-refreshed", "a day-old cache is refreshed")
+        cache["fetched"] -= 2 * 86400
+        with open(os.path.join(pstate, "prices.json"), "w") as f:
+            json.dump(cache, f)
+        missing = pathlib.Path(os.path.join(tmp, "no-such-page.md")).as_uri()
+        cache["url"] = missing
+        with open(os.path.join(pstate, "prices.json"), "w") as f:
+            json.dump(cache, f)
+        j = priced({"SHUNT_PRICES_URL": missing}, pstate)
+        report(j.get("prices", {}).get("claude-sonnet-5-5") == 3.0 and "refresh failed" in (j.get("prices_source") or ""),
+               "prices-stale-cache", "a failed refresh falls back to the stale cache and says so")
+        j = priced({"SHUNT_PRICES_URL": missing}, os.path.join(tmp, "price-state-empty"))
+        report(j.get("prices", {}).get("claude-opus-5-5") == 4.0 and "built-in" in (j.get("prices_source") or "")
+               and "fetch failed" in (j.get("prices_source") or ""), "prices-builtin-fallback",
+               "no page and no cache: the built-in table, and the report says why")
+        with open(page, "w") as f:
+            f.write("# Pricing\n\nMoved.\n")
+        j = priced({"SHUNT_PRICES_URL": url}, os.path.join(tmp, "price-state-bad"))
+        report("built-in" in (j.get("prices_source") or ""), "prices-unparseable",
+               "a page without a usable table is not trusted")
         p = subprocess.run([REPORT, "--since", "7d", "--by", "session"], capture_output=True, text=True, env=renv)
         report(p.returncode == 0 and "session: s1" in p.stdout and "session: s2" in p.stdout and "Est. net saving" in p.stdout,
                "report-by-session", "--by session prints a block per session after the total")
+        p = subprocess.run([REPORT, "--since", "7d", "--by", "project"], capture_output=True, text=True, env=renv)
+        report(p.returncode == 0 and "project: /proj2" in p.stdout and "project: /proj" in p.stdout,
+               "report-by-project", "--by project groups routing-only sessions by their logged cwd")
         p = subprocess.run([REPORT, "--since", "2026-13-01"], capture_output=True, text=True, env=renv)
         report(p.returncode != 0 and "YYYY-MM-DD" in p.stderr, "report-bad-date", "an unreadable date fails with a hint")
         p = subprocess.run([REPORT], capture_output=True, text=True, env=hook_env({"SHUNT_STATE_DIR": os.path.join(tmp, "none")}))
         report(p.returncode == 0 and "No shunt activity" in p.stdout, "report-empty", "no log yet: says so")
+
+        # Retention: a daily pass drops old log events, stale ledgers and old off switches.
+        kstate, ktmp = os.path.join(tmp, "keep-state"), os.path.join(tmp, "keep-tmp")
+        ledgers = os.path.join(ktmp, "shunt-cc")
+        os.makedirs(os.path.join(kstate, "off"))
+        os.makedirs(ledgers)
+        day = 86400
+
+        def old_file(path, days):
+            open(path, "w").close()
+            os.utime(path, (now - days * day, now - days * day))
+
+        def write_log(rows, extra=""):
+            with open(os.path.join(kstate, "usage.jsonl"), "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in rows) + extra)
+
+        write_log([{"ts": now - 400 * day, "event": "deny", "session": "old", "tokens": 1},
+                   {"ts": now - 10 * day, "event": "deny", "session": "recent", "tokens": 1}], "not json\n")
+        old_file(os.path.join(kstate, "off", "ended-session"), 40)
+        old_file(os.path.join(kstate, "off", "live-session"), 1)
+        old_file(os.path.join(ledgers, "ended-session.json"), 8)
+        old_file(os.path.join(ledgers, "live-session.json"), 1)
+        kenv = hook_env({"SHUNT_STATE_DIR": kstate, "TMPDIR": ktmp})
+
+        def deny_big(e):
+            payload = {"hook_event_name": "PreToolUse", "tool_name": "Read", "session_id": "keep",
+                       "cwd": tmp, "tool_input": {"file_path": big}}
+            subprocess.run([HOOK, "read"], input=json.dumps(payload), capture_output=True, text=True, env=e)
+
+        def log_sessions():
+            out = []
+            for line in open(os.path.join(kstate, "usage.jsonl")):
+                try:
+                    out.append(json.loads(line).get("session"))
+                except ValueError:
+                    out.append("(unreadable)")
+            return out
+
+        deny_big(kenv)
+        sessions = log_sessions()
+        report(sessions == ["recent", "(unreadable)", "keep"], "retention-log",
+               "events older than SHUNT_LOG_DAYS (365) are dropped; recent and unreadable lines and the new event kept"
+               if sessions == ["recent", "(unreadable)", "keep"] else "log sessions: {}".format(sessions))
+        left = sorted(os.listdir(os.path.join(kstate, "off"))) + sorted(os.listdir(ledgers))
+        report(left == ["live-session", "live-session.json"], "retention-sessions",
+               "off switches over 30 days and ledgers idle over 7 days are removed; live ones kept"
+               if left == ["live-session", "live-session.json"] else "left: {}".format(left))
+        write_log([{"ts": now - 400 * day, "event": "deny", "session": "old", "tokens": 1}])
+        deny_big(kenv)
+        report(log_sessions() == ["old", "keep"], "retention-daily",
+               "the pass runs at most once a day: a second event the same day leaves the log alone")
+        os.remove(os.path.join(kstate, ".pruned"))
+        deny_big(hook_env({"SHUNT_STATE_DIR": kstate, "TMPDIR": ktmp, "SHUNT_LOG_DAYS": "0"}))
+        report(log_sessions() == ["old", "keep", "keep"], "retention-off", "SHUNT_LOG_DAYS=0 keeps the whole log")
+        os.remove(os.path.join(kstate, ".pruned"))
+        deny_big(hook_env({"SHUNT_STATE_DIR": kstate, "TMPDIR": ktmp, "SHUNT_LOG_DAYS": "30"}))
+        report(log_sessions() == ["keep", "keep", "keep"], "retention-days", "SHUNT_LOG_DAYS sets how many days are kept")
     finally:
         shutil.rmtree(tmp)
 

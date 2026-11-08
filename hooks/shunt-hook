@@ -31,7 +31,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
@@ -39,6 +38,9 @@ import outline  # noqa: E402
 import shunt_state  # noqa: E402
 
 DEFAULT_MIN_LINES = 600
+CWD = ""  # the session's cwd from the hook payload, for the usage log
+TRANSCRIPT = ""  # the session's transcript, where the main model's id is recorded
+TRANSCRIPT_TAIL = 256 * 1024
 READ_TOOL_DEFAULT_LIMIT = 2000
 SEPARATORS = {";", "&&", "||", "&", "\n", ";;", "(", ")"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -94,8 +96,7 @@ def merge(spans):
 
 
 def ledger_file(session_id):
-    ledger_dir = os.path.join(tempfile.gettempdir(), "shunt-cc")
-    return os.path.join(ledger_dir, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
+    return os.path.join(shunt_state.ledger_dir(), re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
 
 
 def lines_read(session_id, path):
@@ -146,6 +147,32 @@ def line_tokens(path, total, lines):
     return shunt_state.tokens(lines * per_line)
 
 
+def session_model(transcript_path=None):
+    """The model of the session's latest assistant message, from the end of its
+    transcript, or None (no transcript yet, unreadable, or none written)."""
+    transcript_path = transcript_path or TRANSCRIPT
+    if not transcript_path:
+        return None
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(f.tell() - TRANSCRIPT_TAIL, 0))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if b'"assistant"' not in line or b'"model"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # the first line of the tail may be cut
+        message = record.get("message") if isinstance(record, dict) else None
+        if record.get("type") == "assistant" and isinstance(message, dict) and message.get("model"):
+            return message["model"]
+    return None
+
+
 def check_large_file(path, span, session_id, verb):
     """Deny a whole or bounded read of a large file when it should be delegated."""
     total, threshold = count_lines(path), min_lines()
@@ -169,9 +196,11 @@ def check_large_file(path, span, session_id, verb):
                        path, total, start, end, covered, budget),
                    budget - before)
     if covered > before:
-        shunt_state.log_event("read", session=session_id, path=os.path.realpath(path),
+        shunt_state.log_event("read", session=session_id, cwd=CWD, model=session_model(),
+                              path=os.path.realpath(path),
                               lines=covered - before,
-                              tokens=line_tokens(path, total, covered - before))
+                              tokens=line_tokens(path, total, covered - before),
+                              file_tokens=line_tokens(path, total, total))
 
 
 def deny_large(path, total, session_id, kind, headline, left):
@@ -191,8 +220,10 @@ def deny_large(path, total, session_id, kind, headline, left):
         "report a finding.".format(
             "use the outline above, or " if shape else "", max(left, 0), bulk_read_cmd(path)))
     reason = "\n".join(parts)
-    shunt_state.log_event("deny", session=session_id, path=os.path.realpath(path), kind=kind,
-                          lines=total, outline=bool(shape), tokens=shunt_state.tokens(len(reason)))
+    shunt_state.log_event("deny", session=session_id, cwd=CWD, model=session_model(),
+                          path=os.path.realpath(path), kind=kind,
+                          lines=total, outline=bool(shape), tokens=shunt_state.tokens(len(reason)),
+                          file_tokens=line_tokens(path, total, total))
     deny(reason)
 
 
@@ -491,7 +522,7 @@ def session_start(cwd, session_id):
         "survey or summarize a whole file, or skim a long log, use the bulk-reader "
         "skill.".format(
             threshold, ", ".join("{} ({:,} lines)".format(rel, n) for n, rel in files)))
-    shunt_state.log_event("list", session=session_id, files=len(files),
+    shunt_state.log_event("list", session=session_id, cwd=cwd, files=len(files),
                           tokens=shunt_state.tokens(len(context)))
     json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                       "additionalContext": context}}, sys.stdout)
@@ -508,6 +539,8 @@ def main():
         if shunt_state.disabled(session_id):
             return
         cwd = payload.get("cwd") or os.getcwd()
+        global CWD, TRANSCRIPT
+        CWD, TRANSCRIPT = cwd, payload.get("transcript_path") or ""
         if mode == "read":
             check_read(tool_input, session_id)
         elif mode == "bash":

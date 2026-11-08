@@ -54,9 +54,10 @@ Also:
 
 - **Easy off switch.** `SHUNT_DISABLE=1`, or `/shunt-cc:shunt off` for one
   session.
-- **Logged.** Every deny, follow-up read and `bulk-read` call is logged, and
-  `shunt-report` summarizes the log for any period. The A/B eval
-  (`evals/ab/`) is what measures the plugin's effect.
+- **Logged.** Every deny, narrow read of a large file and `bulk-read` call is
+  logged, and `shunt-report` estimates the tokens and dollars kept out by
+  routing and by delegation for any period. The A/B eval (`evals/ab/`) is
+  what measures the plugin's effect.
 
 ## What's inside
 
@@ -104,8 +105,9 @@ budget of `SHUNT_READ_BUDGET` distinct lines per session (default:
 - `offset` alone reads to Read's 2000-line default, and `offset: 0` or
   `limit: 0` with no real bound counts as a whole-file read. Those were open
   bypasses in shunt.
-- The ledger is a JSON file per session under `$TMPDIR/shunt-cc/`. Hook input
-  without a `session_id` gets only the per-read check.
+- The ledger is a JSON file per session under `$TMPDIR/shunt-cc/`, removed
+  after 7 days without a new read. Hook input without a `session_id` gets only
+  the per-read check.
 
 **Bash**: applies the same rule to `cat`, `less`, `more`, `head`, `tail`,
 `rtk read` and `rtk cat`, including:
@@ -238,11 +240,24 @@ before an edit or a reported finding.
 ## Measuring savings
 
 Each event goes to `usage.jsonl` in `SHUNT_STATE_DIR` (default
-`~/.local/state/shunt-cc/`) as one JSON line: a `delegate` per `bulk-read` call,
-with Haiku's reported usage and cost and the citation check; a `deny` with the
-tokens its message costs; a `list` per session start; and a `read` per bounded
-read of a large file, counting only lines not read before. Logging never fails
-a read, and `SHUNT_LOG=0` turns it off.
+`~/.local/state/shunt-cc/`) as one JSON line, with the session and its cwd:
+
+- a `deny`, with the tokens its message costs, the denied file's size in
+  tokens, and the main model;
+- a `read` per bounded read of a large file, counting only lines not read
+  before, also with the file's size and the main model;
+- a `list` per session start;
+- a `delegate` per `bulk-read` call, with Haiku's reported usage and cost and
+  the citation check.
+
+Logging never fails a read, and `SHUNT_LOG=0` turns it off.
+
+**Retention.** At most once a day, the first logged event runs a cleanup
+pass. It drops log events older than `SHUNT_LOG_DAYS` (default 365; `0` keeps
+everything), read-budget ledgers not touched for 7 days, and per-session off
+switches older than 30 days. The log is rewritten in place under a file lock,
+so hooks running in parallel don't lose events. A year of heavy use is a few
+MB. `shunt-report --since all` only reaches back as far as the log does.
 
 ```bash
 scripts/shunt-report                 # last 7 days
@@ -256,30 +271,63 @@ Or `/shunt-cc:shunt report 30d` in a session.
 ```
 shunt-cc, 2026-10-31 14:02 to now
 ---------------------------------
-Delegations      42 calls, 61 files, 18 sessions; 12 cache hits (29%); 1 failed
-Kept out         1,234,000 tokens of files read by Haiku instead
-Brought back     93,000 tokens: answers 31,000, deny messages 9,800, file lists 2,200, follow-up reads 50,000
-Net kept out     1,141,000 tokens (92% of what was sent)
-Haiku cost       $0.2100 (1,402,000 tokens, as reported by each call)
-Main-model value $4.5640 at $4.00/MTok input (opus), if each file were otherwise read whole
-Est. net saving  $4.3540
-Citations        310 checked, 296 matched (95%), 14 flagged
-Denied reads     57 (41 whole-file, 16 over budget) on 49 files; 20 handled without Haiku
+Routing          1,180,000 tokens of large files kept out: 96 files in 41 sessions read in ranges, not whole
+Delegations      4 calls, 4 files, 3 sessions; 1 cache hits (25%); 0 failed
+Delegated        98,000 tokens of files read by Haiku instead
+Brought back     169,000 tokens: deny messages 41,000, file lists 4,300, narrow reads 118,000, answers 2,600, follow-up reads 3,100
+Net kept out     1,109,000 tokens (87% of the files' size)
+Haiku cost       $0.0120 (104,000 tokens, as reported by each call)
+Main-model value $3.9100 if each file were otherwise read whole once; priced by session model: claude-opus-5-5 29, claude-sonnet-5-5 12
+Prices           list prices from https://platform.claude.com/docs/en/about-claude/pricing.md, fetched 2026-11-08 11:05
+Est. net saving  $3.8980
+Citations        160 cited, 151 matched (94%), 7 without a quote, 2 flagged
+Denied reads     55 (47 whole-file, 8 over budget) on 52 files; 49 handled without Haiku
 ```
 
-(Illustrative numbers.) "Kept out" assumes the model would otherwise have read
-each delegated file whole once. "Brought back" is what shunt itself put into
-the main context, including narrow reads of a file after it was delegated in
-the same session: the cost of checking Haiku's answer. "Handled without Haiku"
-counts denied files that were never delegated, where the outline and narrow
-reads were enough. The dollar value prices net tokens once at the main model's
-input rate (`--main-model opus|sonnet|fable|haiku` or `--price-per-mtok`).
+(Illustrative numbers.) Each figure is counted once per file per session:
 
-These delegation figures are estimates, not measurements. "Kept out" assumes
-each delegated file would otherwise have been read whole, but with the hooks on
-the model usually reads a few ranges instead, so the figures can overstate what
-`bulk-read` adds. The report doesn't measure the routing's own saving; the A/B
-eval below does.
+- **Routing** is the core saving. It counts large files that a hook denied or
+  budgeted, or that the model read only in ranges, and that were never sent to
+  Haiku. Each such file counts at its full size.
+- **Delegated** counts the files sent to Haiku.
+- **Brought back** is what shunt put into the main context instead: deny
+  messages with their outlines, the session-start list, the narrow reads of
+  routed files, Haiku's answers, and the follow-up reads that check them.
+
+The dollar value prices each session's net tokens once, at the input rate of
+the model that session ran on, minus Haiku's reported cost. Hook payloads don't
+include the model, so the hooks read it from the session's transcript (the
+latest assistant message, from the last 256 KB). A session that switched
+models with `/model` is priced at the last one logged.
+
+Rates are Anthropic's current list prices for input tokens, by exact model id.
+The report reads them from the Markdown version of the [pricing
+page](https://platform.claude.com/docs/en/about-claude/pricing.md), which has a
+per-model table (the Models API has no prices), and caches them for a day in
+`SHUNT_STATE_DIR/prices.json`. The `Prices` line says where the rates came
+from. If the page can't be fetched, or no longer has a table it can parse, the
+report uses the last cached prices, then a built-in table, and says why.
+`SHUNT_PRICES=off` skips the fetch, for offline use. Platform model ids
+(`us.anthropic.…`, `…@20251101`, `[1m]`) are normalized first. Haiku 5.5 is
+priced at its rate for prompts up to 100K tokens. These are first-party API
+rates: Bedrock and Vertex AI price separately, and a subscription has no
+per-token price, so there the figure is what the same tokens would cost on the
+API.
+
+A model the table doesn't list is priced as the current model of its family. A
+session with no logged model (log lines from before 0.4.0) is priced as the
+current Opus, and counted on that line. `--main-model opus|sonnet|fable|haiku`
+(the current model of that family) or `--price-per-mtok N` prices every
+session at one rate instead. `--by project` groups sessions by their logged
+cwd.
+
+These are estimates, not measurements. They assume each file would otherwise
+have been read whole once, which roughly matches the A/B eval's plugin-off
+arm. They don't count files the model only grepped, and they overstate files
+it would have read only in part anyway. The report can't see the main
+session's actual cost, so the A/B eval below is the measurement. Log lines
+from before 0.4.0 carry no file size: those files are left out of the
+estimate and counted separately in the Routing line.
 
 ## Requirements
 
@@ -337,6 +385,9 @@ Set these in your shell or in `settings.json` under `"env"`.
 | `SHUNT_LIST_LARGEST` | `8` | hooks | Files listed at session start; `0` turns the list off. |
 | `SHUNT_STATE_DIR` | `~/.local/state/shunt-cc` | all | Usage log and per-session switches. `$XDG_STATE_HOME/shunt-cc` when that's set. |
 | `SHUNT_LOG` | (unset) | all | `0` turns the usage log off. |
+| `SHUNT_LOG_DAYS` | `365` | all | Days of usage log to keep; `0` keeps it all. Checked at most once a day. |
+| `SHUNT_PRICES` | (unset) | shunt-report | `off` skips fetching list prices and uses the built-in table. |
+| `SHUNT_PRICES_URL` | Anthropic's pricing page (`.md`) | shunt-report | Where list prices are read from. |
 | `SHUNT_CHILD` | (unset) | both | Set to `1` on the child. Hooks pass everything through and `bulk-read` refuses to run. Don't set it yourself. |
 
 ## Usage
@@ -361,7 +412,7 @@ to stderr.
 python3 evals/run.py
 ```
 
-This runs 191 cases with no network access or login needed:
+This runs 205 cases with no network access or login needed:
 
 - **Read hook (45)**: adapted from shunt's `hook-evals.json` with a threshold of
   600, plus binary files, directories, `pages`, a file with no trailing newline,
@@ -384,8 +435,13 @@ This runs 191 cases with no network access or login needed:
   files.
 - **Session start (6)**: the largest-files list, its limit, and when it stays
   silent.
-- **Usage log, toggle and report (9)**: what gets logged, `shunt-toggle`, and
-  `shunt-report` totals on a synthetic log.
+- **Usage log, toggle, report and retention (23)**: what gets logged (including the main
+  model from a transcript), `shunt-toggle`, and `shunt-report` routing and
+  delegation totals, per-model pricing and groupings on a synthetic log. Also
+  list prices from a local copy of the pricing page: parsing, the one-day
+  cache, refresh, and the fallbacks to a stale cache and the built-in table.
+  And retention: old events, ledgers and off switches removed, at most once a
+  day, with `SHUNT_LOG_DAYS` honored.
 
 Where shunt's expected results differ here, the case's `reason` starts with
 CHANGED or FIXED. Bounded `head` and `tail` now pass (they work like Read with a

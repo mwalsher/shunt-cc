@@ -1,6 +1,6 @@
 ---
 name: bulk-reader
-description: Delegate reading large files to Haiku so only the answer enters your context. Use it instead of reading whole, or guessing from grep, when you need to understand, summarize or survey a file over ~600 lines, locate code across several files, or skim a large log or diff. Also use it whenever a shunt hook denies a Read or cat of a large file and the outline in the deny message isn't enough.
+description: Optional. Ask Haiku a question about a whole large file (over ~600 lines) or log, so only its answer enters your context. Use it to survey or summarize a whole large file, or skim a long log or diff, when the outline in a shunt deny message, grep -n and narrow Reads aren't enough. Not for finding a name or string, or for code you are about to edit or debug: grep -n and a narrow Read are cheaper there.
 ---
 
 # bulk-reader
@@ -8,14 +8,23 @@ description: Delegate reading large files to Haiku so only the answer enters you
 Sends whole files to Haiku (headless Claude Code, no tools) with your question
 and prints Haiku's answer. The file contents never enter your context.
 
+This is an optional tool, not the default way to read code. In the plugin's
+A/B eval, the savings came from the hooks (outline, read budget, the list of
+large files); forcing bulk-read first cost no less overall, cost more on small
+tasks (locate, edit, debug), and added about 27 seconds a task.
+
 ## Pick the cheapest route
 
 1. **The outline.** A shunt deny message lists the file's symbols with line
    numbers. If you know which part you need, Read just that range with
    `offset`/`limit`. This costs no model call.
-2. **`grep -n`**, then a narrow Read, for a name or string you can search for.
-3. **bulk-read**, when you need the whole file understood: what it does, where
-   something is handled, which parts relate to a question, a survey of a log.
+2. **`grep -n`**, then a narrow Read, for a name or string you can search for,
+   in one file or several.
+3. **bulk-read**, only when you need a whole file understood at once and
+   narrow reads would add up to most of it: an overview or summary of a large
+   file, a survey of a long log or diff. Don't use it to locate code you could
+   grep for, or for code you're about to edit or debug: you'll Read those
+   lines anyway.
 
 Each large file has a per-session budget of distinct lines (about 600 by
 default). Narrow reads fit; paging through the file in chunks doesn't, and the

@@ -2,31 +2,127 @@
 """Report what shunt-cc saved over a period, from its usage log.
 
 Usage: shunt-report [--since 7d|30d|24h|YYYY-MM-DD] [--until YYYY-MM-DD]
-                    [--by day|session|project] [--main-model opus|sonnet|fable]
+                    [--by day|session|project] [--main-model opus|sonnet|fable|haiku]
                     [--price-per-mtok N] [--json]
 
-Tokens kept out of the main context are estimated from the files sent to Haiku
-(about 4 characters a token). Brought back counts what shunt itself put into
-the main context: Haiku's answers, deny messages with their outlines, the
-session-start file list, and narrow reads of a file after it was delegated
-in the same session. Haiku's cost is the actual cost each call reported.
+Tokens kept out of the main context are estimated (about 4 characters a
+token) in two parts, each counted once per file per session:
+  - routing: large files the hooks denied or budgeted and that were read only in
+    ranges, never delegated; the whole file counts as kept out;
+  - delegation: files sent to Haiku with bulk-read.
+Brought back counts what shunt put into the main context instead: deny messages
+with their outlines, the session-start file list, the narrow reads of those
+files, and Haiku's answers. Haiku's cost is the actual cost each call reported.
 
-The main-model figure prices the net tokens once, at the model's input rate.
-That is a floor: tokens left in context are re-read on every later turn.
+The main-model figure prices each session's net tokens once, at the input
+rate of the model that session ran on, as the hooks logged it from the
+session's transcript. Rates are Anthropic's list prices, read from the
+pricing page (SHUNT_PRICES_URL) and cached for a day in SHUNT_STATE_DIR; if the
+page can't be fetched or parsed, the last cached prices are used, then a
+built-in table. SHUNT_PRICES=off skips the fetch. A model the table doesn't
+list is priced as the current model of its family; a session with no logged
+model (older log lines) as the current Opus. --main-model or --price-per-mtok
+prices every session at one rate instead.
+It assumes each of these files would otherwise have been read whole once, so it
+is an estimate, not a measurement: it misses files the model only grepped, and
+overstates files it would have read in part anyway. The A/B eval (evals/ab/)
+measures the plugin's effect on real sessions.
 """
 import argparse
 import collections
 import datetime
 import json
 import os
+import re
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import shunt_state  # noqa: E402
 
-# Input price per million tokens (Anthropic API list prices).
-MAIN_PRICES = {"opus": 4.00, "sonnet": 2.00, "fable": 10.00, "haiku": 0.10}
+# Base input price per million tokens (Anthropic API list prices), used when
+# the pricing page can't be read. Haiku 5.5 is priced at its rate for prompts up
+# to 100K tokens.
+BUILTIN_PRICES = {
+    "claude-fable-5-1": 10.00, "claude-mythos-5-1": 10.00, "claude-fable-5": 10.00, "claude-mythos-5": 10.00,
+    "claude-opus-5-5": 4.00, "claude-opus-5": 5.00, "claude-opus-4-8": 5.00, "claude-opus-4-7": 5.00,
+    "claude-opus-4-6": 5.00, "claude-opus-4-5": 5.00,
+    "claude-sonnet-5-5": 2.00, "claude-sonnet-5": 2.00, "claude-sonnet-4-6": 3.00, "claude-sonnet-4-5": 3.00,
+    "claude-haiku-5-5": 0.10, "claude-haiku-4-5": 1.00,
+}
+BUILTIN_AS_OF = "2026-11-08"
+# The current model of each family: --main-model, and models the table doesn't list.
+FAMILIES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "fable": "claude-fable-5-1",
+            "haiku": "claude-haiku-5-5"}
+PRICES_URL = "https://platform.claude.com/docs/en/about-claude/pricing.md"
+PRICES_TTL = 86400
+FETCH_TIMEOUT = 5
+
+
+def parse_prices(markdown):
+    """{model id: base input $/MTok} from the pricing page's "Model pricing"
+    table. A model listed twice (Haiku 5.5 by prompt length) keeps its first,
+    lower-tier row."""
+    section = re.search(r"^## Model pricing\s*$(.*?)(?=^## )", markdown, re.M | re.S)
+    prices = {}
+    for line in (section.group(1) if section else "").splitlines():
+        cells = line.split("|")
+        if len(cells) < 4:
+            continue
+        name = re.match(r"\s*Claude ([A-Za-z]+) (\d+(?:\.\d+)?)\b", cells[1])
+        price = re.search(r"\$\s*([\d.]+)\s*/\s*MTok", cells[2])
+        if name and price:
+            model_id = "claude-{}-{}".format(name.group(1).lower(), name.group(2).replace(".", "-"))
+            prices.setdefault(model_id, float(price.group(1)))
+    return prices
+
+
+def plausible(prices):
+    """A parse worth trusting: several models, with a current Opus and Sonnet."""
+    return (len(prices) >= 5 and any(k.startswith("claude-opus-") for k in prices)
+            and any(k.startswith("claude-sonnet-") for k in prices)
+            and all(0 < v < 1000 for v in prices.values()))
+
+
+def load_prices():
+    """(prices, where they came from). Never raises: falls back to the cache,
+    then to the built-in table."""
+    builtin = (dict(BUILTIN_PRICES), "built-in list prices from {}".format(BUILTIN_AS_OF))
+    if os.environ.get("SHUNT_PRICES", "").lower() in ("off", "0", "builtin"):
+        return builtin
+    url = os.environ.get("SHUNT_PRICES_URL") or PRICES_URL
+    cache_path = os.path.join(shunt_state.state_dir(), "prices.json")
+    cached = None
+    try:
+        with open(cache_path) as f:
+            cached = json.load(f)
+        if cached.get("url") != url or not plausible(cached.get("prices") or {}):
+            cached = None
+    except (OSError, ValueError, AttributeError):
+        cached = None
+    when = lambda c: datetime.datetime.fromtimestamp(c["fetched"]).strftime("%Y-%m-%d %H:%M")
+    if cached and time.time() - cached.get("fetched", 0) < PRICES_TTL:
+        return cached["prices"], "list prices from {}, fetched {}".format(url, when(cached))
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "shunt-report"})
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as r:
+            prices = parse_prices(r.read().decode("utf-8", errors="replace"))
+        if not plausible(prices):
+            raise ValueError("no usable price table on the page")
+        fresh = {"url": url, "fetched": time.time(), "prices": prices}
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(fresh, f)
+        except OSError:
+            pass
+        return prices, "list prices from {}, fetched {}".format(url, when(fresh))
+    except Exception as e:  # network, HTTP, parse: fall back, and say so
+        reason = "{}: {}".format(type(e).__name__, e)[:120]
+        if cached:
+            return cached["prices"], "list prices cached {} (refresh failed: {})".format(when(cached), reason)
+        return builtin[0], "{} (fetch failed: {})".format(builtin[1], reason)
 
 
 def parse_when(text, end=False):
@@ -70,10 +166,59 @@ def group_key(e, by, projects):
     return "all"
 
 
-def summarize(events, price):
+def normalize_model(model_id):
+    """'us.anthropic.claude-opus-5-5[1m]' or 'claude-opus-4-5@20251101' -> the
+    first-party id, without platform prefixes, date suffixes or context tags."""
+    model_id = (model_id or "").lower().strip()
+    model_id = re.sub(r"\[.*?\]$", "", model_id)
+    model_id = re.sub(r"^(?:[a-z]{2,4}\.)?anthropic\.", "", model_id)
+    model_id = re.sub(r"(?:@|-)\d{8}(?:-v\d+(?::\d+)?)?$", "", model_id)
+    return model_id
+
+
+def model_family(model_id):
+    """'claude-opus-5-5' -> 'opus'; None for an unknown or missing id."""
+    model_id = (model_id or "").lower()
+    return next((name for name in FAMILIES if name in model_id), None)
+
+
+def session_models(events):
+    """session -> the main model it last ran on, from the logged events."""
+    models = {}
+    for e in sorted(events, key=lambda e: e["ts"]):
+        if e.get("session") and e.get("model"):
+            models[e["session"]] = e["model"]
+    return models
+
+
+def pricer(models, prices, forced=None, label=None, fallback="opus"):
+    """price_of(session) -> (price per MTok, how it was priced)."""
+    def current(family):
+        model_id = FAMILIES[family]
+        return prices.get(model_id, BUILTIN_PRICES[model_id])
+
+    def price_of(session):
+        if forced is not None:
+            return forced, label
+        logged = models.get(session)
+        model_id = normalize_model(logged)
+        if model_id in prices:
+            return prices[model_id], model_id
+        family = model_family(model_id)
+        if family:
+            return current(family), "{} (as {})".format(model_id, FAMILIES[family])
+        return current(fallback), "unknown"
+    return price_of
+
+
+def summarize(events, price_of):
     s = collections.Counter()
+    net_by = collections.Counter()  # session -> net tokens kept out, priced at its model's rate
     delegated = {}  # (session, path) -> ts of first delegation
     denied = set()
+    sized = {}  # (session, path) -> whole-file tokens, from deny and read events
+    touched = set()  # (session, path) with a deny or a read
+    narrow = collections.Counter()  # (session, path) -> tokens of reads not after a delegation
     for e in sorted(events, key=lambda e: e["ts"]):
         kind, session = e.get("event"), e.get("session", "")
         if kind == "delegate":
@@ -87,6 +232,7 @@ def summarize(events, price):
             s["files"] += len(e.get("paths", []))
             s["kept_out"] += e.get("tokens", 0)
             s["answers"] += e.get("answer_tokens", 0)
+            net_by[session] += e.get("tokens", 0) - e.get("answer_tokens", 0)
             s["cache_hits"] += 1 if e.get("cache_hit") else 0
             v = e.get("verify") or {}
             s["cited"] += v.get("cited", 0)
@@ -98,24 +244,53 @@ def summarize(events, price):
         elif kind == "deny":
             s["denies"] += 1
             s["deny_tokens"] += e.get("tokens", 0)
+            net_by[session] -= e.get("tokens", 0)
             s["denies_" + e.get("kind", "whole")] += 1
-            denied.add((session, e.get("path")))
+            key = (session, e.get("path"))
+            denied.add(key)
+            touched.add(key)
+            if e.get("file_tokens"):
+                sized[key] = max(sized.get(key, 0), e["file_tokens"])
         elif kind == "list":
             s["list_tokens"] += e.get("tokens", 0)
+            net_by[session] -= e.get("tokens", 0)
         elif kind == "read":
             key = (session, e.get("path"))
+            touched.add(key)
+            if e.get("file_tokens"):
+                sized[key] = max(sized.get(key, 0), e["file_tokens"])
             if key in delegated and delegated[key] <= e["ts"]:
                 s["followup_tokens"] += e.get("tokens", 0)
                 s["followup_reads"] += 1
+                net_by[session] -= e.get("tokens", 0)
             else:
                 s["direct_tokens"] += e.get("tokens", 0)
+                narrow[key] += e.get("tokens", 0)
     s["denied_files"] = len(denied)
     s["denied_without_haiku"] = len([k for k in denied if k not in delegated])
     s["sessions"] = len({e.get("session") for e in events if e.get("event") == "delegate"})
-    s["brought_back"] = s["answers"] + s["deny_tokens"] + s["list_tokens"] + s["followup_tokens"]
-    s["net"] = s["kept_out"] - s["brought_back"]
-    s["main_usd"] = s["net"] * price / 1e6
+    # Routing: large files handled in ranges, never delegated. Older log lines
+    # carry no file size; those files are left out of the estimate and counted.
+    routed = [k for k in touched if k not in delegated and k in sized]
+    s["routed_files"] = len(routed)
+    s["routed_sessions"] = len({k[0] for k in routed})
+    s["routed_out"] = sum(sized[k] for k in routed)
+    s["routed_reads"] = sum(narrow[k] for k in routed)
+    s["unsized_files"] = len([k for k in touched if k not in delegated and k not in sized])
+    for k in routed:
+        net_by[k[0]] += sized[k] - narrow[k]
+    s["brought_back"] = (s["answers"] + s["deny_tokens"] + s["list_tokens"] + s["followup_tokens"]
+                         + s["routed_reads"])
+    s["net"] = s["kept_out"] + s["routed_out"] - s["brought_back"]
+    priced_as = collections.Counter()
+    main_usd = 0.0
+    for session, net in net_by.items():
+        price, how = price_of(session)
+        main_usd += net * price / 1e6
+        priced_as[how] += 1
+    s["main_usd"] = main_usd
     s["saved_usd"] = s["main_usd"] - s["haiku_usd"]
+    s["priced_as"] = dict(priced_as)
     return s
 
 
@@ -123,21 +298,38 @@ def pct(a, b):
     return "{:.0f}%".format(100.0 * a / b) if b else "-"
 
 
-def render(title, s, price, model):
+def priced_as_text(priced_as, forced):
+    if forced is not None:
+        return "at ${:.2f}/MTok input ({})".format(*forced)
+    known = sorted((k for k in priced_as if k != "unknown"), key=lambda k: (-priced_as[k], k))
+    parts = ["{} {:,}".format(k, priced_as[k]) for k in known]
+    if priced_as.get("unknown"):
+        parts.append("no logged model (as {}) {:,}".format(FAMILIES["opus"], priced_as["unknown"]))
+    return "by session model: {}".format(", ".join(parts) or "no sessions")
+
+
+def render(title, s, forced, source=None):
     out = [title, "-" * len(title)]
-    if not (s["calls"] or s["denies"] or s["failed"]):
+    if not (s["calls"] or s["denies"] or s["failed"] or s["routed_files"]):
         return "\n".join(out + ["No shunt activity in this period."])
+    unsized = "; {:,} more from older log lines, not sized".format(s["unsized_files"]) if s["unsized_files"] else ""
     out += [
+        "Routing          {:,} tokens of large files kept out: {:,} files in {:,} sessions read in ranges, not whole{}".format(
+            s["routed_out"], s["routed_files"], s["routed_sessions"], unsized),
         "Delegations      {:,} calls, {:,} files, {:,} sessions; {:,} cache hits ({}); {:,} failed".format(
             s["calls"], s["files"], s["sessions"], s["cache_hits"], pct(s["cache_hits"], s["calls"]), s["failed"]),
-        "Kept out         {:,} tokens of files read by Haiku instead".format(s["kept_out"]),
-        "Brought back     {:,} tokens: answers {:,}, deny messages {:,}, file lists {:,}, follow-up reads {:,}".format(
-            s["brought_back"], s["answers"], s["deny_tokens"], s["list_tokens"], s["followup_tokens"]),
-        "Net kept out     {:,} tokens ({} of what was sent)".format(s["net"], pct(s["net"], s["kept_out"])),
+        "Delegated        {:,} tokens of files read by Haiku instead".format(s["kept_out"]),
+        "Brought back     {:,} tokens: deny messages {:,}, file lists {:,}, narrow reads {:,}, "
+        "answers {:,}, follow-up reads {:,}".format(
+            s["brought_back"], s["deny_tokens"], s["list_tokens"], s["routed_reads"], s["answers"],
+            s["followup_tokens"]),
+        "Net kept out     {:,} tokens ({} of the files' size)".format(
+            s["net"], pct(s["net"], s["kept_out"] + s["routed_out"])),
         "Haiku cost       ${:.4f} ({:,} tokens, as reported by each call)".format(s["haiku_usd"], s["haiku_tokens"]),
-        "Main-model value ${:.4f} at ${:.2f}/MTok input ({}); a floor, since context is re-read each turn".format(
-            s["main_usd"], price, model),
-        "Net saving       ${:.4f}".format(s["saved_usd"]),
+        "Main-model value ${:.4f} if each file were otherwise read whole once; priced {}".format(
+            s["main_usd"], priced_as_text(s["priced_as"], forced)),
+        "Prices           {}".format(source or "set on the command line"),
+        "Est. net saving  ${:.4f}".format(s["saved_usd"]),
         "Citations        {:,} cited, {:,} matched ({}), {:,} without a quote, {:,} flagged".format(
             s["cited"], s["cited_ok"], pct(s["cited_ok"], s["cited"]), s["cited_unchecked"], s["flagged"]),
         "Denied reads     {:,} ({:,} whole-file, {:,} over budget) on {:,} files; {:,} handled without Haiku".format(
@@ -151,22 +343,32 @@ def main():
     parser.add_argument("--since", default="7d")
     parser.add_argument("--until")
     parser.add_argument("--by", choices=["day", "session", "project"])
-    parser.add_argument("--main-model", default="opus", choices=sorted(MAIN_PRICES))
-    parser.add_argument("--price-per-mtok", type=float)
+    parser.add_argument("--main-model", choices=sorted(FAMILIES),
+                        help="price every session as this model (default: each session's logged model)")
+    parser.add_argument("--price-per-mtok", type=float, help="price every session at this input rate")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     since = None if args.since in ("all", "") else parse_when(args.since)
     until = parse_when(args.until, end=True)
-    price = args.price_per_mtok if args.price_per_mtok is not None else MAIN_PRICES[args.main_model]
-    model = "custom" if args.price_per_mtok is not None else args.main_model
+    prices, source = ({}, None) if args.price_per_mtok is not None else load_prices()
+    if args.price_per_mtok is not None:
+        forced = (args.price_per_mtok, "custom")
+    elif args.main_model:
+        model_id = FAMILIES[args.main_model]
+        forced = (prices.get(model_id, BUILTIN_PRICES[model_id]), model_id)
+    else:
+        forced = None
     events = load(since, until)
+    # Models come from the whole log, so a session split across --by day groups
+    # or cut by the period is still priced by its model.
+    price_of = pricer(session_models(load(None, None)), prices, *(forced or (None, None)))
 
-    # A session's project is where its first delegation ran.
+    # A session's project is the first cwd logged for it.
     projects = {}
-    for e in events:
-        if e.get("event") == "delegate" and e.get("session"):
-            projects.setdefault(e["session"], e.get("cwd"))
+    for e in sorted(events, key=lambda e: e["ts"]):
+        if e.get("session") and e.get("cwd"):
+            projects.setdefault(e["session"], e["cwd"])
     groups = collections.OrderedDict([("all", events)])
     if args.by:
         groups = collections.OrderedDict()
@@ -176,18 +378,20 @@ def main():
     period = "{} to {}".format(
         datetime.datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M") if since else "the start",
         args.until or "now")
-    results = {k: summarize(v, price) for k, v in groups.items()}
+    results = {k: summarize(v, price_of) for k, v in groups.items()}
     if args.json:
-        json.dump({"period": period, "log": shunt_state.log_path(), "price_per_mtok": price,
+        json.dump({"period": period, "log": shunt_state.log_path(),
+                   "price_per_mtok": forced[0] if forced else None,
+                   "prices": prices, "prices_source": source,
                    "groups": {k: dict(v) for k, v in results.items()}}, sys.stdout, indent=2)
         print()
         return
     blocks = []
     if args.by:
-        blocks.append(render("shunt-cc, {} (all)".format(period), summarize(events, price), price, model))
+        blocks.append(render("shunt-cc, {} (all)".format(period), summarize(events, price_of), forced, source))
     for k, s in results.items():
         title = "shunt-cc, {}".format(period) if not args.by else "{}: {}".format(args.by, k)
-        blocks.append(render(title, s, price, model))
+        blocks.append(render(title, s, forced, source))
     print("\n\n".join(blocks))
 
 

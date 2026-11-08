@@ -1,8 +1,8 @@
 {
   "name": "shunt-cc",
   "displayName": "Shunt CC",
-  "version": "0.3.0",
-  "description": "Saves main-model tokens by sending large file reads to Haiku through headless Claude Code. Hooks deny full reads of large files with an outline and redirect to the bulk-reader skill; only Haiku's answer, with its citations checked, enters your context. Logs and reports the savings.",
+  "version": "0.4.0",
+  "description": "Read routing for large files. Hooks deny whole reads of large files with an outline of symbols and line numbers, cap how much of each file bounded reads bring into context, and list the largest files at session start, so the model greps and reads narrow ranges. An optional bulk-reader skill asks Haiku about a whole file or log, with its citations checked.",
   "author": {
     "name": "mwalsher"
   },
@@ -11,7 +11,8 @@
     "token-optimization",
     "model-routing",
     "delegation",
-    "haiku",
-    "large-files"
+    "read-routing",
+    "large-files",
+    "haiku"
   ]
 }

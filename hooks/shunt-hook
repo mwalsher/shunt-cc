@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: deny full reads of large files and point at bulk-reader.
+"""PreToolUse hook: deny whole reads of large files, with an outline, and cap
+how much of each one bounded reads bring into context.
 SessionStart hook: tell the model which files are large before it reads them.
 
 Usage (from hooks.json):
@@ -14,7 +15,8 @@ Two rules for files over SHUNT_MIN_LINES lines:
     default SHUNT_MIN_LINES), so the file can't be paged into context in
     chunks. Re-reading lines already read costs nothing.
 A deny carries a model-free outline of the file (symbols and line numbers), so
-the model can often Read just the range it needs instead of delegating.
+the model can Read just the range it needs. bulk-read (Haiku) is offered last,
+only for surveying or summarizing a whole file or skimming a log.
 
 Prints nothing to pass through (the normal permission flow decides), or a
 hookSpecificOutput deny with a reason. Never emits "allow": that would skip the
@@ -29,7 +31,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
@@ -37,6 +38,9 @@ import outline  # noqa: E402
 import shunt_state  # noqa: E402
 
 DEFAULT_MIN_LINES = 600
+CWD = ""  # the session's cwd from the hook payload, for the usage log
+TRANSCRIPT = ""  # the session's transcript, where the main model's id is recorded
+TRANSCRIPT_TAIL = 256 * 1024
 READ_TOOL_DEFAULT_LIMIT = 2000
 SEPARATORS = {";", "&&", "||", "&", "\n", ";;", "(", ")"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -92,8 +96,7 @@ def merge(spans):
 
 
 def ledger_file(session_id):
-    ledger_dir = os.path.join(tempfile.gettempdir(), "shunt-cc")
-    return os.path.join(ledger_dir, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
+    return os.path.join(shunt_state.ledger_dir(), re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
 
 
 def lines_read(session_id, path):
@@ -144,6 +147,32 @@ def line_tokens(path, total, lines):
     return shunt_state.tokens(lines * per_line)
 
 
+def session_model(transcript_path=None):
+    """The model of the session's latest assistant message, from the end of its
+    transcript, or None (no transcript yet, unreadable, or none written)."""
+    transcript_path = transcript_path or TRANSCRIPT
+    if not transcript_path:
+        return None
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(f.tell() - TRANSCRIPT_TAIL, 0))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if b'"assistant"' not in line or b'"model"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # the first line of the tail may be cut
+        message = record.get("message") if isinstance(record, dict) else None
+        if record.get("type") == "assistant" and isinstance(message, dict) and message.get("model"):
+            return message["model"]
+    return None
+
+
 def check_large_file(path, span, session_id, verb):
     """Deny a whole or bounded read of a large file when it should be delegated."""
     total, threshold = count_lines(path), min_lines()
@@ -167,30 +196,34 @@ def check_large_file(path, span, session_id, verb):
                        path, total, start, end, covered, budget),
                    budget - before)
     if covered > before:
-        shunt_state.log_event("read", session=session_id, path=os.path.realpath(path),
+        shunt_state.log_event("read", session=session_id, cwd=CWD, model=session_model(),
+                              path=os.path.realpath(path),
                               lines=covered - before,
-                              tokens=line_tokens(path, total, covered - before))
+                              tokens=line_tokens(path, total, covered - before),
+                              file_tokens=line_tokens(path, total, total))
 
 
 def deny_large(path, total, session_id, kind, headline, left):
-    """Deny with an outline of the file and the two ways forward."""
+    """Deny with an outline of the file and the routes forward, cheapest first."""
     shape = outline.outline(path, total)
     parts = [headline]
     if shape:
         parts.append("Outline (line: symbol):\n" + shape)
     parts.append(
-        "Next:\n"
-        "- To edit, debug or review code here, Read just the ranges you need with "
-        "offset/limit (line numbers from {}grep -n); {} more distinct lines of this "
+        "Next, cheapest first:\n"
+        "1. Find the lines: {}`grep -n` for a name or string.\n"
+        "2. Read just that range with offset/limit. {} more distinct lines of this "
         "file fit this session, and re-reads are free.\n"
-        "- To understand, summarize or search the whole file, ask Haiku through the "
-        "bulk-reader skill and get only the answer:\n    {}\n"
-        "  Haiku's answer locates code; before you edit, or report a bug or security "
-        "issue, Read the cited lines and judge them yourself.".format(
-            "the outline and " if shape else "", max(left, 0), bulk_read_cmd(path)))
+        "3. Only to survey or summarize the whole file, or skim a long log, ask Haiku "
+        "through the bulk-reader skill:\n    {}\n"
+        "   Its answer locates code; Read the cited lines yourself before you edit or "
+        "report a finding.".format(
+            "use the outline above, or " if shape else "", max(left, 0), bulk_read_cmd(path)))
     reason = "\n".join(parts)
-    shunt_state.log_event("deny", session=session_id, path=os.path.realpath(path), kind=kind,
-                          lines=total, outline=bool(shape), tokens=shunt_state.tokens(len(reason)))
+    shunt_state.log_event("deny", session=session_id, cwd=CWD, model=session_model(),
+                          path=os.path.realpath(path), kind=kind,
+                          lines=total, outline=bool(shape), tokens=shunt_state.tokens(len(reason)),
+                          file_tokens=line_tokens(path, total, total))
     deny(reason)
 
 
@@ -482,11 +515,14 @@ def session_start(cwd, session_id):
     if not files:
         return
     context = (
-        "shunt-cc: whole-file reads of files over {} lines are denied here. The "
-        "largest tracked files: {}. For these, find lines with grep -n and Read narrow "
-        "ranges; to understand or survey one, use the bulk-reader skill.".format(
+        "shunt-cc: whole-file reads of files over {} lines are denied here, and each "
+        "has a per-session budget of distinct lines. The largest tracked files: {}. "
+        "To work in one, find the lines (a denied Read returns an outline with line "
+        "numbers, or use grep -n), then Read a narrow range with offset/limit. Only to "
+        "survey or summarize a whole file, or skim a long log, use the bulk-reader "
+        "skill.".format(
             threshold, ", ".join("{} ({:,} lines)".format(rel, n) for n, rel in files)))
-    shunt_state.log_event("list", session=session_id, files=len(files),
+    shunt_state.log_event("list", session=session_id, cwd=cwd, files=len(files),
                           tokens=shunt_state.tokens(len(context)))
     json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                       "additionalContext": context}}, sys.stdout)
@@ -503,6 +539,8 @@ def main():
         if shunt_state.disabled(session_id):
             return
         cwd = payload.get("cwd") or os.getcwd()
+        global CWD, TRANSCRIPT
+        CWD, TRANSCRIPT = cwd, payload.get("transcript_path") or ""
         if mode == "read":
             check_read(tool_input, session_id)
         elif mode == "bash":

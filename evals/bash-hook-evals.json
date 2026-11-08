@@ -4,7 +4,7 @@
   "description": "Evals for the Bash hook (shunt-hook bash). Adapted from spotify/portal-ai-plugins shunt bash-hook-evals.json, plus rtk, compound-command and recursion cases. `command` is shorthand for input.tool_input.command; `via_rtk` first runs the real `rtk hook claude` and feeds its rewritten command to shunt (skipped if rtk is not installed).",
   "hook_mode": "bash",
   "evals": [
-    { "name": "cat-large-file", "command": "cat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "Plain cat on large file", "reason_contains": ["bulk-read", "offset/limit", "`cat`"] },
+    { "name": "cat-large-file", "command": "cat {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "Plain cat on large file", "reason_contains": ["`cat`", "`grep -n`", "offset/limit", "bulk-read"] },
     { "name": "cat-small-file", "command": "cat {{FIXTURES}}/small.txt", "expected_decision": "allow", "reason": "Small file" },
     { "name": "cat-boundary", "command": "cat {{FIXTURES}}/boundary.txt", "expected_decision": "allow", "reason": "Exactly at threshold" },
     { "name": "cat-just-over", "command": "cat {{FIXTURES}}/over.txt", "expected_decision": "deny", "reason": "One line over threshold" },

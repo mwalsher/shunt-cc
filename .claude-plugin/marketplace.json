@@ -1,6 +1,6 @@
 {
   "name": "shunt-cc",
-  "description": "Haiku-backed large-file reader for Claude Code: shunt big reads to headless Haiku, keep only the answer.",
+  "description": "Read routing for large files in Claude Code: deny whole reads with an outline, budget narrow reads, list large files up front.",
   "owner": {
     "name": "mwalsher"
   },
@@ -8,8 +8,8 @@
     {
       "name": "shunt-cc",
       "source": "./",
-      "description": "Haiku-backed large-file reader: hooks redirect full reads of large files to a bulk-reader skill backed by headless Claude Code.",
-      "version": "0.3.0"
+      "description": "Hooks deny whole reads of large files with an outline and budget narrow reads; an optional bulk-reader skill asks Haiku about a whole file or log.",
+      "version": "0.4.0"
     }
   ]
 }

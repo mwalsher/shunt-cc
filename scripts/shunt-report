@@ -12,7 +12,10 @@ session-start file list, and narrow reads of a file after it was delegated
 in the same session. Haiku's cost is the actual cost each call reported.
 
 The main-model figure prices the net tokens once, at the model's input rate.
-That is a floor: tokens left in context are re-read on every later turn.
+It is an estimate for delegation only, and it assumes each delegated file would
+otherwise have been read whole. With the hooks on, the outline, grep and narrow
+reads usually avoid that, so it can overstate what bulk-read adds; the A/B eval
+(evals/ab/) measures the plugin as a whole.
 """
 import argparse
 import collections
@@ -135,9 +138,9 @@ def render(title, s, price, model):
             s["brought_back"], s["answers"], s["deny_tokens"], s["list_tokens"], s["followup_tokens"]),
         "Net kept out     {:,} tokens ({} of what was sent)".format(s["net"], pct(s["net"], s["kept_out"])),
         "Haiku cost       ${:.4f} ({:,} tokens, as reported by each call)".format(s["haiku_usd"], s["haiku_tokens"]),
-        "Main-model value ${:.4f} at ${:.2f}/MTok input ({}); a floor, since context is re-read each turn".format(
+        "Main-model value ${:.4f} at ${:.2f}/MTok input ({}), if each file were otherwise read whole".format(
             s["main_usd"], price, model),
-        "Net saving       ${:.4f}".format(s["saved_usd"]),
+        "Est. net saving  ${:.4f}".format(s["saved_usd"]),
         "Citations        {:,} cited, {:,} matched ({}), {:,} without a quote, {:,} flagged".format(
             s["cited"], s["cited_ok"], pct(s["cited_ok"], s["cited"]), s["cited_unchecked"], s["flagged"]),
         "Denied reads     {:,} ({:,} whole-file, {:,} over budget) on {:,} files; {:,} handled without Haiku".format(

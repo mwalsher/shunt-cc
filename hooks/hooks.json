@@ -1,5 +1,5 @@
 {
-  "description": "Deny full reads of large files and redirect them to the bulk-reader skill; list the largest files at session start",
+  "description": "Deny whole reads of large files with an outline, cap bounded reads with a per-file budget, and list the largest files at session start",
   "hooks": {
     "PreToolUse": [
       {

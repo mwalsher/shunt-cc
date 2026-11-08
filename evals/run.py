@@ -352,8 +352,10 @@ def run_session_start_suite():
 
         p, ctx = start(repo)
         ok = ctx and "src/big.py (3,000 lines), src/mid.py (700 lines)" in ctx and "small.py" not in ctx \
-            and "untracked" not in ctx and "bulk-reader" in ctx
-        report(bool(ok), "lists-largest-tracked", "largest first, with line counts; small and untracked files left out"
+            and "untracked" not in ctx and "bulk-reader" in ctx \
+            and ctx.index("grep -n") < ctx.index("offset/limit") < ctx.index("bulk-reader")
+        report(bool(ok), "lists-largest-tracked", "largest first, with line counts; small and untracked files left out; "
+               "grep and narrow reads before bulk-reader"
                if ok else "context={!r} stderr={!r}".format(ctx, p.stderr[-200:]))
         p, ctx = start(repo, {"SHUNT_LIST_LARGEST": "1"})
         report(bool(ctx) and "src/big.py" in ctx and "mid.py" not in ctx, "list-limit", "SHUNT_LIST_LARGEST caps the list")
@@ -450,7 +452,7 @@ def run_ledger_suite():
         report(not wrong and money, "report-totals", "period filter, net tokens, follow-up reads, Haiku cost, saving"
                if not wrong and money else "wrong: {} money_ok={} stderr={}".format(wrong, money, p.stderr[-200:]))
         p = subprocess.run([REPORT, "--since", "7d", "--by", "session"], capture_output=True, text=True, env=renv)
-        report(p.returncode == 0 and "session: s1" in p.stdout and "session: s2" in p.stdout and "Net saving" in p.stdout,
+        report(p.returncode == 0 and "session: s1" in p.stdout and "session: s2" in p.stdout and "Est. net saving" in p.stdout,
                "report-by-session", "--by session prints a block per session after the total")
         p = subprocess.run([REPORT, "--since", "2026-13-01"], capture_output=True, text=True, env=renv)
         report(p.returncode != 0 and "YYYY-MM-DD" in p.stderr, "report-bad-date", "an unreadable date fails with a hint")

@@ -1,5 +1,5 @@
 {
-  "description": "Files generated under {{FIXTURES}} before each suite. A number is a line count; objects allow options.",
+  "description": "Files generated under {{FIXTURES}} before each suite. A number is a line count; objects allow options (generate: a script in evals/fixtures that writes the file).",
   "fixtures": {
     "empty.txt": 0,
     "small.txt": 100,
@@ -11,6 +11,7 @@
     "huge.txt": 5000,
     "dir with space/large.txt": 1200,
     "image.bin": { "binary": true },
+    "inventory_service.py": { "generate": "make_inventory.py" },
     "subdir/": null
   }
 }

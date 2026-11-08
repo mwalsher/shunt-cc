@@ -18,7 +18,8 @@ Changes made: converted to this project's eval format; the threshold
 changed from 350 to 600; "block" changed to "deny"; head/tail and stderr
 redirect expectations changed and a head parser case fixed (marked CHANGED
 or FIXED in each case's reason); cases added for compound commands, globs,
-wrappers, binary files, rtk and the SHUNT_CHILD recursion guard.
+wrappers, binary files, rtk, the SHUNT_CHILD recursion guard, the outline
+in deny messages, and the SHUNT_DISABLE and per-session off switches.
 
 No other file in this repository contains code or text from
 spotify/portal-ai-plugins.

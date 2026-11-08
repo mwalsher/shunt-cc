@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """PreToolUse hook: deny full reads of large files and point at bulk-reader.
+SessionStart hook: tell the model which files are large before it reads them.
 
 Usage (from hooks.json):
-  shunt-hook read   # Read tool
-  shunt-hook bash   # Bash tool: cat/head/tail/less/more/rtk read
+  shunt-hook read            # Read tool
+  shunt-hook bash            # Bash tool: cat/head/tail/less/more/rtk read
+  shunt-hook session-start   # list the repo's largest files
 
 Two rules for files over SHUNT_MIN_LINES lines:
   - a whole-file read is denied;
@@ -11,10 +13,13 @@ Two rules for files over SHUNT_MIN_LINES lines:
     on a per-session, per-file budget of distinct lines (SHUNT_READ_BUDGET,
     default SHUNT_MIN_LINES), so the file can't be paged into context in
     chunks. Re-reading lines already read costs nothing.
+A deny carries a model-free outline of the file (symbols and line numbers), so
+the model can often Read just the range it needs instead of delegating.
 
 Prints nothing to pass through (the normal permission flow decides), or a
 hookSpecificOutput deny with a reason. Never emits "allow": that would skip the
 user's permission prompts. Any internal error passes through (fails open).
+SHUNT_DISABLE=1, or `scripts/shunt-toggle off` for one session, turns it off.
 """
 import fcntl
 import glob
@@ -22,8 +27,14 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import outline  # noqa: E402
+import shunt_state  # noqa: E402
 
 DEFAULT_MIN_LINES = 600
 READ_TOOL_DEFAULT_LIMIT = 2000
@@ -80,25 +91,40 @@ def merge(spans):
     return merged
 
 
+def ledger_file(session_id):
+    ledger_dir = os.path.join(tempfile.gettempdir(), "shunt-cc")
+    return os.path.join(ledger_dir, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
+
+
+def lines_read(session_id, path):
+    """Distinct lines of `path` read this session so far."""
+    try:
+        with open(ledger_file(session_id)) as f:
+            spans = json.load(f).get(os.path.realpath(path), [])
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return sum(end - start + 1 for start, end in spans)
+
+
 def charge(session_id, path, span):
-    """Lines of `path` read this session if `span` is allowed, recording it if
-    that stays within budget. Without a session id there is no ledger, so only
-    the span itself counts."""
+    """(lines of `path` read this session before, and with, `span`), recording
+    the span if it stays within budget. Without a session id there is no
+    ledger, so only the span itself counts."""
     budget = read_budget()
     if not session_id:
-        return span[1] - span[0] + 1, budget
-    ledger_dir = os.path.join(tempfile.gettempdir(), "shunt-cc")
-    os.makedirs(ledger_dir, exist_ok=True)
-    name = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json"
+        return 0, span[1] - span[0] + 1
+    name = ledger_file(session_id)
+    os.makedirs(os.path.dirname(name), exist_ok=True)
     key = os.path.realpath(path)
     # Parallel tool calls run hooks concurrently: lock around read-modify-write.
-    with open(os.path.join(ledger_dir, name), "a+") as f:
+    with open(name, "a+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
         try:
             ledger = json.loads(f.read() or "{}")
         except ValueError:
             ledger = {}
+        before = sum(end - start + 1 for start, end in ledger.get(key, []))
         spans = merge(ledger.get(key, []) + [list(span)])
         covered = sum(end - start + 1 for start, end in spans)
         if covered <= budget:
@@ -106,7 +132,16 @@ def charge(session_id, path, span):
             f.seek(0)
             f.truncate()
             json.dump(ledger, f)
-    return covered, budget
+    return before, covered
+
+
+def line_tokens(path, total, lines):
+    """Rough tokens for `lines` lines of `path` as Read shows them (with numbers)."""
+    try:
+        per_line = os.path.getsize(path) / max(total, 1) + 7  # Read's "  123\t" prefix
+    except OSError:
+        per_line = 40
+    return shunt_state.tokens(lines * per_line)
 
 
 def check_large_file(path, span, session_id, verb):
@@ -117,26 +152,46 @@ def check_large_file(path, span, session_id, verb):
     start, end = max(span[0], 1), min(span[1], total)
     if start > end:
         return
+    budget = read_budget()
     if start == 1 and end == total:
-        deny(
-            "shunt: {} is {} lines (SHUNT_MIN_LINES={}), too large to read whole{}. "
-            "To understand, summarize or search it, use the bulk-reader skill, "
-            "which sends the file to Haiku and returns only the answer:\n  {}\n"
-            "To edit it, Read only the lines you need with offset/limit "
-            "(grep -n finds them).".format(
-                path, total, threshold, " with `{}`".format(verb) if verb else "",
-                bulk_read_cmd(path)))
-    covered, budget = charge(session_id, path, (start, end))
+        deny_large(path, total, session_id, "whole",
+                   "shunt: {} is {} lines (SHUNT_MIN_LINES={}), too large to read whole{}.".format(
+                       path, total, threshold, " with `{}`".format(verb) if verb else ""),
+                   budget - lines_read(session_id, path))
+    before, covered = charge(session_id, path, (start, end))
     if covered > budget:
-        deny(
-            "shunt: {} is {} lines. This read (lines {}-{}) would bring the lines of "
-            "it read this session to {}, over the budget of {} "
-            "(SHUNT_READ_BUDGET). Paging through a large file costs as much as "
-            "reading it whole. To understand, summarize or search it, use the "
-            "bulk-reader skill:\n  {}\n"
-            "To edit it, Read only the few lines you need (grep -n finds them); "
-            "lines you've already read don't count again.".format(
-                path, total, start, end, covered, budget, bulk_read_cmd(path)))
+        deny_large(path, total, session_id, "budget",
+                   "shunt: {} is {} lines. Reading lines {}-{} would bring the lines of it "
+                   "read this session to {}, over the budget of {} (SHUNT_READ_BUDGET): "
+                   "paging through a large file costs as much as reading it whole.".format(
+                       path, total, start, end, covered, budget),
+                   budget - before)
+    if covered > before:
+        shunt_state.log_event("read", session=session_id, path=os.path.realpath(path),
+                              lines=covered - before,
+                              tokens=line_tokens(path, total, covered - before))
+
+
+def deny_large(path, total, session_id, kind, headline, left):
+    """Deny with an outline of the file and the two ways forward."""
+    shape = outline.outline(path, total)
+    parts = [headline]
+    if shape:
+        parts.append("Outline (line: symbol):\n" + shape)
+    parts.append(
+        "Next:\n"
+        "- To edit, debug or review code here, Read just the ranges you need with "
+        "offset/limit (line numbers from {}grep -n); {} more distinct lines of this "
+        "file fit this session, and re-reads are free.\n"
+        "- To understand, summarize or search the whole file, ask Haiku through the "
+        "bulk-reader skill and get only the answer:\n    {}\n"
+        "  Haiku's answer locates code; before you edit, or report a bug or security "
+        "issue, Read the cited lines and judge them yourself.".format(
+            "the outline and " if shape else "", max(left, 0), bulk_read_cmd(path)))
+    reason = "\n".join(parts)
+    shunt_state.log_event("deny", session=session_id, path=os.path.realpath(path), kind=kind,
+                          lines=total, outline=bool(shape), tokens=shunt_state.tokens(len(reason)))
+    deny(reason)
 
 
 def deny(reason):
@@ -383,6 +438,60 @@ def check_bash(tool_input, cwd, session_id):
                     if total:
                         check_large_file(path, span(total), session_id, verb)
 
+# ── SessionStart ─────────────────────────────────────────────────────────────
+
+LIST_TIME_BUDGET = 3.0  # seconds of line counting before giving up on the rest
+
+
+def largest_files(cwd, threshold, limit):
+    """[(lines, relpath)] for the largest tracked text files over threshold.
+
+    Sizes come from stat; only the biggest candidates are line-counted, under
+    a time budget, so this stays fast in big repos. Outside git: nothing.
+    """
+    try:
+        out = subprocess.run(["git", "-C", cwd, "ls-files", "-z"], capture_output=True,
+                             timeout=3).stdout.decode("utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sized = []
+    for rel in filter(None, out.split("\0")):
+        try:
+            size = os.path.getsize(os.path.join(cwd, rel))
+        except OSError:
+            continue
+        if size > threshold * 8:  # below ~8 bytes a line, it can't be over threshold
+            sized.append((size, rel))
+    sized.sort(reverse=True)
+    found, started = [], time.time()
+    for _, rel in sized[:200]:
+        if time.time() - started > LIST_TIME_BUDGET:
+            break
+        n = count_lines(os.path.join(cwd, rel))
+        if n and n > threshold:
+            found.append((n, rel))
+    return sorted(found, reverse=True)[:limit]
+
+
+def session_start(cwd, session_id):
+    limit = env_lines("SHUNT_LIST_LARGEST", 8)
+    if not limit:
+        return
+    threshold = min_lines()
+    files = largest_files(cwd, threshold, limit)
+    if not files:
+        return
+    context = (
+        "shunt-cc: whole-file reads of files over {} lines are denied here. The "
+        "largest tracked files: {}. For these, find lines with grep -n and Read narrow "
+        "ranges; to understand or survey one, use the bulk-reader skill.".format(
+            threshold, ", ".join("{} ({:,} lines)".format(rel, n) for n, rel in files)))
+    shunt_state.log_event("list", session=session_id, files=len(files),
+                          tokens=shunt_state.tokens(len(context)))
+    json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                      "additionalContext": context}}, sys.stdout)
+
+
 def main():
     if os.environ.get("SHUNT_CHILD"):
         return  # recursion guard: never interfere inside a shunt child
@@ -391,10 +500,15 @@ def main():
         payload = json.load(sys.stdin)
         tool_input = payload.get("tool_input") or {}
         session_id = payload.get("session_id") or ""
+        if shunt_state.disabled(session_id):
+            return
+        cwd = payload.get("cwd") or os.getcwd()
         if mode == "read":
             check_read(tool_input, session_id)
         elif mode == "bash":
-            check_bash(tool_input, payload.get("cwd") or os.getcwd(), session_id)
+            check_bash(tool_input, cwd, session_id)
+        elif mode == "session-start":
+            session_start(cwd, session_id)
     except SystemExit:
         raise
     except Exception as e:  # fail open: a hook bug must never block work

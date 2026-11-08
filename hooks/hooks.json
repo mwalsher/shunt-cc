@@ -1,5 +1,5 @@
 {
-  "description": "Deny full reads of large files and redirect them to the bulk-reader skill",
+  "description": "Deny full reads of large files and redirect them to the bulk-reader skill; list the largest files at session start",
   "hooks": {
     "PreToolUse": [
       {
@@ -18,6 +18,17 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/shunt-hook\" bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/shunt-hook\" session-start",
             "timeout": 10
           }
         ]

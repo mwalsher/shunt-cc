@@ -5,8 +5,9 @@ Usage: bulk-read --question "what does this do?" --paths file1 [file2 ...]
 
 Files go to the child on stdin, wrapped in <file path="..."> tags with line
 numbers, in a prompt-cached block: follow-up questions about the same paths
-within the cache TTL are much cheaper. Only the answer is printed; a rough
-token note goes to stderr.
+within the cache TTL are much cheaper. Only the answer is printed, followed by
+a check of its citations against the files (lib/verify.py, no model); a rough
+token note goes to stderr. Each call is logged for `shunt-report`.
 """
 import argparse
 import glob
@@ -14,20 +15,37 @@ import html
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import shunt_state  # noqa: E402
+import verify  # noqa: E402
+
 SYSTEM_PROMPT = (
-    "You answer one question about the files given in <file path=\"...\"> tags. "
-    "Every file line is prefixed with its line number and a tab; cite those numbers. "
-    "Answer only from the files. Reply in terse structured bullets: name the "
-    "relevant functions, classes, keys or symbols and give path:line or "
-    "path:start-end for each. Quote code only when the exact text matters, and "
-    "keep quotes short. If the files do not answer the question, say so. "
-    "No preamble, no closing summary."
+    "You answer one question about the files given in <file path=\"...\"> tags, "
+    "for another model that will read the code you point to and decide what it "
+    "means. Each file line starts with its line number and a tab; the number is "
+    "not part of the code. Answer only from the files, in terse bullets. For each "
+    "point, write path:line or path:start-end and right after it the key line from "
+    "there in backticks, copied exactly without the line number; that first quote "
+    "is checked against the cited lines. Say what the code is and does, not "
+    "whether it is correct, safe or well designed: no severity or confidence "
+    "ratings. If the question asks for bugs, risks or a review, list the places "
+    "worth checking as leads, each with the facts that make it one (for example, "
+    "a parameter concatenated into a shell command), and leave the verdict to the "
+    "reader. Claim something is absent only for a name or call you looked for, and "
+    "name it (\"no call to eval or pickle\"), never \"no issues\". If the files "
+    "do not answer the question, say so. Then, under \"Related code:\", cite up to "
+    "three places the question did not ask about that touch the same names or "
+    "state: other callers or writers, a comment or docstring on the cited code, a "
+    "second definition. Quote them the same way and say what each is, without "
+    "judging it; leave the section out if there are none. No preamble, no closing "
+    "summary."
 )
 
 
@@ -59,9 +77,16 @@ def find_claude():
     fail("claude CLI not found; install it or set SHUNT_CLAUDE_BIN")
 
 
+def display_names(paths):
+    """Names for the <file> tags. Haiku repeats them in every citation, so use
+    the basename when it's unique among the paths, else the path as given."""
+    base = [os.path.basename(p) for p in paths]
+    return [b if base.count(b) == 1 else p for p, b in zip(paths, base)]
+
+
 def build_files(paths):
     parts = []
-    for path in paths:
+    for path, name in zip(paths, display_names(paths)):
         with open(path, "rb") as f:
             data = f.read()
         if b"\0" in data[:8192]:
@@ -69,7 +94,7 @@ def build_files(paths):
         lines = data.decode("utf-8", errors="replace").splitlines()
         numbered = "\n".join("{}\t{}".format(n, line) for n, line in enumerate(lines, 1))
         parts.append('<file path="{}">\n{}\n</file>\n'.format(
-            html.escape(path, quote=True), numbered))
+            html.escape(name, quote=True), numbered))
     return "\n".join(parts)
 
 
@@ -123,6 +148,7 @@ def main():
     if ttl not in ("1h", "5m", "off"):
         fail("SHUNT_CACHE_TTL must be 1h, 5m or off")
     files = build_files(args.paths)
+    line_count = len(re.findall(r"^\d+\t", files, re.M))
 
     cmd = [
         find_claude(), "-p",
@@ -144,6 +170,18 @@ def main():
     # own TTL, so on a TTL error retry with the other TTL, then with none.
     ttls = [ttl] + [t for t in ("1h", "5m", "off") if t != ttl and ttl != "off"]
     started = time.time()
+    child = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "cost_usd": 0.0}
+
+    def record(ok, **extra):
+        """Log this call for shunt-report. `tokens` estimates what reading the
+        files whole would have put in the main context."""
+        shunt_state.log_event(
+            "delegate", ok=ok, session=os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+            cwd=os.getcwd(), model=model, effort=effort,
+            paths=[os.path.realpath(p) for p in args.paths], lines=line_count,
+            tokens=shunt_state.tokens(len(files)), child=child,
+            seconds=round(time.time() - started, 1), **extra)
+
     # Run from an empty directory so the child discovers no project CLAUDE.md.
     with tempfile.TemporaryDirectory(prefix="shunt-") as cwd:
         for attempt in ttls:
@@ -152,25 +190,43 @@ def main():
                                       capture_output=True, text=True, cwd=cwd, env=env,
                                       timeout=timeout)
             except subprocess.TimeoutExpired:
+                record(False, error="timeout")
                 fail("{} timed out after {}s (raise SHUNT_TIMEOUT)".format(model, timeout), 124)
             result = last_result(proc.stdout)
+            add_usage(child, result)
             answer = (result.get("result") or "").strip()
             if not (result.get("is_error") and "cache_control" in answer):
                 break
 
     stderr_tail = proc.stderr.strip()[-2000:]
+    error = None
     if proc.returncode != 0:
-        fail("claude exited {}: {}".format(proc.returncode, answer or stderr_tail or proc.stdout.strip()[-2000:]))
-    if result.get("is_error") or result.get("subtype", "success") != "success":
-        fail("{} returned an error ({}): {}".format(model, result.get("subtype"), answer or stderr_tail))
-    if not answer:
-        fail("{} returned an empty answer{}".format(model, ": " + stderr_tail if stderr_tail else ""))
+        error = "claude exited {}: {}".format(proc.returncode, answer or stderr_tail or proc.stdout.strip()[-2000:])
+    elif result.get("is_error") or result.get("subtype", "success") != "success":
+        error = "{} returned an error ({}): {}".format(model, result.get("subtype"), answer or stderr_tail)
+    elif not answer:
+        error = "{} returned an empty answer{}".format(model, ": " + stderr_tail if stderr_tail else "")
+    if error:
+        record(False, error=error[:200])
+        fail(error)
 
-    print(answer)
-    cached = (result.get("usage") or {}).get("cache_read_input_tokens") or 0
+    summary, footer = verify.check(answer, args.paths)
+    output = answer + "\n\n" + footer
+    print(output)
+    record(True, answer_tokens=shunt_state.tokens(len(output)), verify=summary,
+           cache_hit=child["cache_read"] > 1000)
     print("[shunt: ~{} input tokens ({} files{}) -> {} ({}), {:.0f}s]".format(
-        len(files) // 4, len(args.paths), ", cache hit" if cached > 1000 else "",
+        len(files) // 4, len(args.paths), ", cache hit" if child["cache_read"] > 1000 else "",
         model, effort, time.time() - started), file=sys.stderr)
+
+
+def add_usage(child, result):
+    """Add one child run's usage and cost to the running totals."""
+    usage = result.get("usage") or {}
+    for key, field in (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"),
+                       ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens")):
+        child[key] += int(usage.get(field) or 0)
+    child["cost_usd"] = round(child["cost_usd"] + float(result.get("total_cost_usd") or 0), 6)
 
 if __name__ == "__main__":
     main()

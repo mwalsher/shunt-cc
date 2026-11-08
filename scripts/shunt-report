@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Report what shunt-cc saved over a period, from its usage log.
+
+Usage: shunt-report [--since 7d|30d|24h|YYYY-MM-DD] [--until YYYY-MM-DD]
+                    [--by day|session|project] [--main-model opus|sonnet|fable]
+                    [--price-per-mtok N] [--json]
+
+Tokens kept out of the main context are estimated from the files sent to Haiku
+(about 4 characters a token). Brought back counts what shunt itself put into
+the main context: Haiku's answers, deny messages with their outlines, the
+session-start file list, and narrow reads of a file after it was delegated
+in the same session. Haiku's cost is the actual cost each call reported.
+
+The main-model figure prices the net tokens once, at the model's input rate.
+That is a floor: tokens left in context are re-read on every later turn.
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import shunt_state  # noqa: E402
+
+# Input price per million tokens (Anthropic API list prices).
+MAIN_PRICES = {"opus": 4.00, "sonnet": 2.00, "fable": 10.00, "haiku": 0.10}
+
+
+def parse_when(text, end=False):
+    """Seconds since the epoch for '7d', '24h', '2w' or a YYYY-MM-DD date."""
+    if not text:
+        return None
+    units = {"h": 3600, "d": 86400, "w": 7 * 86400}
+    if text[:-1].isdigit() and text[-1] in units:
+        return time.time() - int(text[:-1]) * units[text[-1]]
+    try:
+        day = datetime.datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise SystemExit("shunt-report: can't read the date {!r}; use 7d, 24h or YYYY-MM-DD".format(text))
+    return (day + datetime.timedelta(days=1 if end else 0)).timestamp()
+
+
+def load(since, until):
+    events = []
+    try:
+        with open(shunt_state.log_path()) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                ts = e.get("ts", 0)
+                if (since is None or ts >= since) and (until is None or ts < until):
+                    events.append(e)
+    except OSError:
+        pass
+    return events
+
+
+def group_key(e, by, projects):
+    if by == "day":
+        return datetime.datetime.fromtimestamp(e["ts"]).strftime("%Y-%m-%d")
+    if by == "session":
+        return e.get("session") or "(none)"
+    if by == "project":
+        return projects.get(e.get("session")) or e.get("cwd") or "(unknown)"
+    return "all"
+
+
+def summarize(events, price):
+    s = collections.Counter()
+    delegated = {}  # (session, path) -> ts of first delegation
+    denied = set()
+    for e in sorted(events, key=lambda e: e["ts"]):
+        kind, session = e.get("event"), e.get("session", "")
+        if kind == "delegate":
+            child = e.get("child") or {}
+            s["haiku_usd"] += child.get("cost_usd", 0)
+            s["haiku_tokens"] += sum(child.get(k, 0) for k in ("input", "cache_write", "cache_read", "output"))
+            if not e.get("ok"):
+                s["failed"] += 1
+                continue
+            s["calls"] += 1
+            s["files"] += len(e.get("paths", []))
+            s["kept_out"] += e.get("tokens", 0)
+            s["answers"] += e.get("answer_tokens", 0)
+            s["cache_hits"] += 1 if e.get("cache_hit") else 0
+            v = e.get("verify") or {}
+            s["cited"] += v.get("cited", 0)
+            s["cited_ok"] += v.get("ok", 0)
+            s["cited_unchecked"] += v.get("unchecked", 0)
+            s["flagged"] += v.get("flagged", 0)
+            for p in e.get("paths", []):
+                delegated.setdefault((session, p), e["ts"])
+        elif kind == "deny":
+            s["denies"] += 1
+            s["deny_tokens"] += e.get("tokens", 0)
+            s["denies_" + e.get("kind", "whole")] += 1
+            denied.add((session, e.get("path")))
+        elif kind == "list":
+            s["list_tokens"] += e.get("tokens", 0)
+        elif kind == "read":
+            key = (session, e.get("path"))
+            if key in delegated and delegated[key] <= e["ts"]:
+                s["followup_tokens"] += e.get("tokens", 0)
+                s["followup_reads"] += 1
+            else:
+                s["direct_tokens"] += e.get("tokens", 0)
+    s["denied_files"] = len(denied)
+    s["denied_without_haiku"] = len([k for k in denied if k not in delegated])
+    s["sessions"] = len({e.get("session") for e in events if e.get("event") == "delegate"})
+    s["brought_back"] = s["answers"] + s["deny_tokens"] + s["list_tokens"] + s["followup_tokens"]
+    s["net"] = s["kept_out"] - s["brought_back"]
+    s["main_usd"] = s["net"] * price / 1e6
+    s["saved_usd"] = s["main_usd"] - s["haiku_usd"]
+    return s
+
+
+def pct(a, b):
+    return "{:.0f}%".format(100.0 * a / b) if b else "-"
+
+
+def render(title, s, price, model):
+    out = [title, "-" * len(title)]
+    if not (s["calls"] or s["denies"] or s["failed"]):
+        return "\n".join(out + ["No shunt activity in this period."])
+    out += [
+        "Delegations      {:,} calls, {:,} files, {:,} sessions; {:,} cache hits ({}); {:,} failed".format(
+            s["calls"], s["files"], s["sessions"], s["cache_hits"], pct(s["cache_hits"], s["calls"]), s["failed"]),
+        "Kept out         {:,} tokens of files read by Haiku instead".format(s["kept_out"]),
+        "Brought back     {:,} tokens: answers {:,}, deny messages {:,}, file lists {:,}, follow-up reads {:,}".format(
+            s["brought_back"], s["answers"], s["deny_tokens"], s["list_tokens"], s["followup_tokens"]),
+        "Net kept out     {:,} tokens ({} of what was sent)".format(s["net"], pct(s["net"], s["kept_out"])),
+        "Haiku cost       ${:.4f} ({:,} tokens, as reported by each call)".format(s["haiku_usd"], s["haiku_tokens"]),
+        "Main-model value ${:.4f} at ${:.2f}/MTok input ({}); a floor, since context is re-read each turn".format(
+            s["main_usd"], price, model),
+        "Net saving       ${:.4f}".format(s["saved_usd"]),
+        "Citations        {:,} cited, {:,} matched ({}), {:,} without a quote, {:,} flagged".format(
+            s["cited"], s["cited_ok"], pct(s["cited_ok"], s["cited"]), s["cited_unchecked"], s["flagged"]),
+        "Denied reads     {:,} ({:,} whole-file, {:,} over budget) on {:,} files; {:,} handled without Haiku".format(
+            s["denies"], s["denies_whole"], s["denies_budget"], s["denied_files"], s["denied_without_haiku"]),
+    ]
+    return "\n".join(out)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--since", default="7d")
+    parser.add_argument("--until")
+    parser.add_argument("--by", choices=["day", "session", "project"])
+    parser.add_argument("--main-model", default="opus", choices=sorted(MAIN_PRICES))
+    parser.add_argument("--price-per-mtok", type=float)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    since = None if args.since in ("all", "") else parse_when(args.since)
+    until = parse_when(args.until, end=True)
+    price = args.price_per_mtok if args.price_per_mtok is not None else MAIN_PRICES[args.main_model]
+    model = "custom" if args.price_per_mtok is not None else args.main_model
+    events = load(since, until)
+
+    # A session's project is where its first delegation ran.
+    projects = {}
+    for e in events:
+        if e.get("event") == "delegate" and e.get("session"):
+            projects.setdefault(e["session"], e.get("cwd"))
+    groups = collections.OrderedDict([("all", events)])
+    if args.by:
+        groups = collections.OrderedDict()
+        for e in sorted(events, key=lambda e: e["ts"]):
+            groups.setdefault(group_key(e, args.by, projects), []).append(e)
+
+    period = "{} to {}".format(
+        datetime.datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M") if since else "the start",
+        args.until or "now")
+    results = {k: summarize(v, price) for k, v in groups.items()}
+    if args.json:
+        json.dump({"period": period, "log": shunt_state.log_path(), "price_per_mtok": price,
+                   "groups": {k: dict(v) for k, v in results.items()}}, sys.stdout, indent=2)
+        print()
+        return
+    blocks = []
+    if args.by:
+        blocks.append(render("shunt-cc, {} (all)".format(period), summarize(events, price), price, model))
+    for k, s in results.items():
+        title = "shunt-cc, {}".format(period) if not args.by else "{}: {}".format(args.by, k)
+        blocks.append(render(title, s, price, model))
+    print("\n\n".join(blocks))
+
+
+if __name__ == "__main__":
+    main()

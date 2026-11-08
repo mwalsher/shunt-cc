@@ -1,9 +1,10 @@
 schema_version: "1.1"
 name: bug-hunt-large-file
 description: >
-  Whole-file understanding of a 1,261-line file without naming the skill. The
-  two planted bugs live in method bodies, so grep on names can't find them.
-  The model should delegate to bulk-read rather than page through the file.
+  Bug hunt in a 1,261-line file without naming the skill. The two planted bugs
+  live in method bodies, so grep on names can't find them. The model may use
+  the deny message's outline, bulk-read or grep to locate code, but must not
+  page through the file, and judges the code itself.
 tags: [behavior, skill-trigger]
 runs: 2
 context:
@@ -15,11 +16,6 @@ execution:
     Review inventory_service.py for bugs in how stock levels change. List each
     bug with the method and line.
 graders:
-  - name: used-bulk-read
-    type: tool_used
-    tool: Bash
-    input_match: 'scripts/bulk-read'
-    min: 1
   - name: no-paging
     # Reading the file in big chunks defeats the point: no Read of 200+ lines.
     type: tool_used

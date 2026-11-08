@@ -15,22 +15,57 @@ Example: a 2,575-line file is about 27k tokens. Through `bulk-read`, a
 structured answer with line numbers costs the main model about 700 tokens and
 takes about 11 seconds.
 
+Delegating trades exact recall for a smaller context: the main model sees only
+an answer shaped by its question, and the cheaper model's mistakes look like
+facts. shunt-cc limits that trade:
+
+- **Cheapest route first.** A deny carries a model-free outline of the file
+  (symbols and line ranges), so the model can often Read the one range it
+  needs and skip Haiku. A SessionStart hook lists the repo's largest files, so
+  the model knows before it tries.
+- **Checked citations.** Haiku must cite `path:line` and quote the code, and
+  `bulk-read` checks every citation against the files before printing the
+  answer. Wrong lines and invented quotes are flagged.
+- **Haiku locates, the main model judges.** Haiku says what the code does
+  and where, and gives possible bugs or risks only as leads, with no verdicts
+  or confidence ratings. The skill keeps debugging, review, security and
+  design reasoning local: the main model reads the cited code and decides.
+  Haiku also points to related code the question didn't ask about.
+- **Easy off switch.** `SHUNT_DISABLE=1`, or `/shunt-cc:shunt off` for one
+  session.
+- **Measured.** Every delegation, deny and follow-up read is logged, and
+  `shunt-report` turns the log into tokens and dollars saved for any period.
+  An A/B eval runs real tasks with the plugin on and off.
+
 ## What's inside
 
 | Path | Purpose |
 |---|---|
-| `hooks/shunt-hook` | PreToolUse hook for `Read` and `Bash`. Denies full reads of files over `SHUNT_MIN_LINES`. |
-| `scripts/bulk-read` | `--question "..." --paths f1 [f2 ...]`. Wraps the files in `<file path="...">` tags with line numbers and asks Haiku once. |
-| `skills/bulk-reader/SKILL.md` | When and how the model should use `bulk-read`, and to verify line numbers before editing. |
-| `evals/` | Hook and transport eval suite (`python3 evals/run.py`). |
+| `hooks/shunt-hook` | PreToolUse hook for `Read` and `Bash`: denies full reads of files over `SHUNT_MIN_LINES`, with an outline. SessionStart hook: lists the largest tracked files. |
+| `scripts/bulk-read` | `--question "..." --paths f1 [f2 ...]`. Wraps the files in `<file path="...">` tags with line numbers, asks Haiku once, and checks the answer's citations. |
+| `scripts/shunt-report` | Tokens and dollars saved over a period, from the usage log. |
+| `scripts/shunt-toggle` | `off`, `on` or `status` for the current session. |
+| `skills/bulk-reader/SKILL.md` | When to use the outline, grep or `bulk-read`, and how to check Haiku's answer. |
+| `skills/shunt/SKILL.md` | `/shunt-cc:shunt off\|on\|status\|report [period]`, for you rather than the model. |
+| `lib/` | The outline, the citation check, and the shared state (usage log, session switches). |
+| `evals/` | Deterministic suite (`python3 evals/run.py`), behavior cases, and the A/B eval (`evals/ab/`). |
 
 ### Hook rules
 
 **Read**: denies a whole-file Read when the file has more than `SHUNT_MIN_LINES`
 lines. It lets through files at or under the threshold, `pages` reads, missing
 paths, directories, and binary files (images and PDFs, which Read handles
-natively). The deny reason gives the exact `bulk-read` command, and suggests
-Read with offset/limit when exact text is needed for an edit.
+natively). The deny reason has three parts:
+
+- an outline of the file: classes, functions, headings or keys with their line
+  numbers, and the line range of each top-level symbol. It comes from regexes
+  per file type (Python, JS/TS, Go, Rust, JVM languages, C/C++, Ruby, PHP,
+  shell, Markdown, YAML, TOML, SQL), costs no model call, and is capped at about
+  800 tokens. Other file types get no outline.
+- how many distinct lines of the file still fit in the read budget, for
+  reading just the ranges needed to edit, debug or review;
+- the exact `bulk-read` command for questions about the whole file, with a
+  reminder to read the cited lines before editing or reporting a bug.
 
 **Read budget (large files only)**: reads with `offset`/`limit` pass until they
 would page a large file into context piece by piece. Each large file has a
@@ -60,6 +95,15 @@ budget of `SHUNT_READ_BUDGET` distinct lines per session (default:
 Pipes (`cat big | grep x`) and stdout redirects (`> out`, `>> out`, `&>`) pass,
 because the file doesn't land in context. `2>/dev/null` alone doesn't divert
 stdout, so it is still checked.
+
+**SessionStart**: in a git repo, lists up to `SHUNT_LIST_LARGEST` (default 8)
+tracked files over `SHUNT_MIN_LINES`, largest first, so the model picks a route
+before a Read is denied. It stats every tracked file but counts lines only in
+the 200 largest, for at most 3 seconds. Outside git it adds nothing.
+
+**Off switch**: with `SHUNT_DISABLE=1` every hook passes everything through.
+`scripts/shunt-toggle off` (or `/shunt-cc:shunt off`) does the same for one
+session, keyed on `CLAUDE_CODE_SESSION_ID`, until `on`.
 
 To pass a command through, the hook prints nothing and the normal permission
 flow decides. It never emits `permissionDecision: "allow"`, because that would
@@ -114,9 +158,97 @@ The API rejects a 1h breakpoint after a 5m one, and Claude Code picks its own
 TTLs. If the child reports a `cache_control` error, `bulk-read` retries with the
 other TTL, then with no breakpoint.
 
+**Short names.** Each file is tagged with its basename when that's unique
+among the paths, else the path as given. Haiku repeats the name in every
+citation, so long absolute paths would double the answer.
+
 `bulk-read` fails with a nonzero exit and an error on stderr for a missing or
 binary file, an empty answer, a nonzero exit, an `is_error` result, unparseable
 output, or a timeout (exit 124).
+
+### Checking the answer
+
+The system prompt asks Haiku to cite `path:line` or `path:start-end` for every
+point, with the key line from there quoted in backticks right after it. Haiku
+says what code is and does, not whether it is correct or safe: a question
+about bugs or risks gets a list of leads, each with the facts that make it one,
+and no severity or confidence. It claims something is absent only for a named
+call it looked for ("no call to eval"), never "no issues". Then a "Related
+code:" list cites up to three places the question didn't ask about that touch
+the same names or state (other callers or writers, a comment on the cited
+code), without judging them.
+
+Before printing, `bulk-read` checks each citation against the files
+(`lib/verify.py`, no model call):
+
+- the file must be one that was sent, and the lines must exist;
+- the citation's quote, the code span right after it (on its line, opening
+  the indented line under it, or a fenced block after it), must appear at
+  the cited lines, give or take two. Code further on is prose ("a.py:3 says
+  holds are skipped, but nothing reads `hold['open']`"), and so is code past
+  the ")" of a citation in parentheses; neither is checked;
+- a quote that is just a function or class name in the file must be the
+  symbol the cited lines sit in, per the outline;
+- a `Class.method` name right next to the citation ("`A.b` at a.py:3",
+  "a.py:3 (`A.b`)"), before its quote, must be the method the cited lines sit
+  in, when the file has that class (`ledger.adjust`, an instance's call, isn't
+  a label);
+- a bare "line N `code`" after a citation is checked as a citation of the
+  same file;
+- a citation with no quote or name is reported as unchecked, not as a match.
+
+A line at the end of the answer reports the result, and lists up to eight
+problems with the line where a misplaced quote really is:
+
+```
+[shunt-verify: 8 of 9 citations match the files; check these before relying on them:
+  ! inventory_service.py:120: "def release(self, ledger, order_id):" is at line 376]
+```
+
+A passing citation means the quote is where Haiku says. It doesn't mean Haiku
+read the code correctly, which is why the skill still asks for a narrow Read
+before an edit or a reported finding.
+
+## Measuring savings
+
+Each event goes to `usage.jsonl` in `SHUNT_STATE_DIR` (default
+`~/.local/state/shunt-cc/`) as one JSON line: a `delegate` per `bulk-read` call,
+with Haiku's reported usage and cost and the citation check; a `deny` with the
+tokens its message costs; a `list` per session start; and a `read` per bounded
+read of a large file, counting only lines not read before. Logging never fails
+a read, and `SHUNT_LOG=0` turns it off.
+
+```bash
+scripts/shunt-report                 # last 7 days
+scripts/shunt-report --since 30d --by day
+scripts/shunt-report --since 2026-11-01 --until 2026-11-07 --by project --main-model sonnet
+scripts/shunt-report --since all --json
+```
+
+Or `/shunt-cc:shunt report 30d` in a session.
+
+```
+shunt-cc, 2026-10-31 14:02 to now
+---------------------------------
+Delegations      42 calls, 61 files, 18 sessions; 12 cache hits (29%); 1 failed
+Kept out         1,234,000 tokens of files read by Haiku instead
+Brought back     93,000 tokens: answers 31,000, deny messages 9,800, file lists 2,200, follow-up reads 50,000
+Net kept out     1,141,000 tokens (92% of what was sent)
+Haiku cost       $0.2100 (1,402,000 tokens, as reported by each call)
+Main-model value $4.5640 at $4.00/MTok input (opus); a floor, since context is re-read each turn
+Net saving       $4.3540
+Citations        310 checked, 296 matched (95%), 14 flagged
+Denied reads     57 (41 whole-file, 16 over budget) on 49 files; 20 handled without Haiku
+```
+
+(Illustrative numbers.) "Kept out" assumes the model would otherwise have read
+each delegated file whole once. "Brought back" is what shunt itself put into
+the main context, including narrow reads of a file after it was delegated in
+the same session: the cost of checking Haiku's answer. "Handled without Haiku"
+counts denied files that were never delegated, where the outline and narrow
+reads were enough. The dollar value prices net tokens once at the main model's
+input rate (`--main-model opus|sonnet|fable|haiku` or `--price-per-mtok`); since
+context is re-read on every later turn, the real saving is higher.
 
 ## Requirements
 
@@ -170,6 +302,10 @@ Set these in your shell or in `settings.json` under `"env"`.
 | `SHUNT_TIMEOUT` | `300` | bulk-read | Seconds before the child is killed (exit 124). |
 | `SHUNT_CACHE_TTL` | `1h` | bulk-read | Prompt-cache TTL for the files block: `1h`, `5m` or `off`. |
 | `SHUNT_CLAUDE_BIN` | (auto) | bulk-read | Path to the `claude` binary. |
+| `SHUNT_DISABLE` | (unset) | hooks | `1` turns shunt-cc off: hooks pass everything through. |
+| `SHUNT_LIST_LARGEST` | `8` | hooks | Files listed at session start; `0` turns the list off. |
+| `SHUNT_STATE_DIR` | `~/.local/state/shunt-cc` | all | Usage log and per-session switches. `$XDG_STATE_HOME/shunt-cc` when that's set. |
+| `SHUNT_LOG` | (unset) | all | `0` turns the usage log off. |
 | `SHUNT_CHILD` | (unset) | both | Set to `1` on the child. Hooks pass everything through and `bulk-read` refuses to run. Don't set it yourself. |
 
 ## Usage
@@ -181,7 +317,7 @@ description or from the hook's deny message. To call the script directly:
 scripts/bulk-read --question "Which functions handle retries? Give line numbers." --paths src/client.ts src/retry.ts
 ```
 
-The answer goes to stdout. A note like
+The answer goes to stdout, followed by the citation check. A note like
 `[shunt: ~27456 input tokens (1 files) -> claude-haiku-5-5 (medium), 11s]` goes
 to stderr.
 
@@ -193,20 +329,31 @@ to stderr.
 python3 evals/run.py
 ```
 
-This runs 139 cases with no network access or login needed:
+This runs 191 cases with no network access or login needed:
 
-- **Read hook (38)**: adapted from shunt's `hook-evals.json` with a threshold of
+- **Read hook (45)**: adapted from shunt's `hook-evals.json` with a threshold of
   600, plus binary files, directories, `pages`, a file with no trailing newline,
   malformed input, the recursion guard, and the read budget: paging, re-reads,
-  overlaps, per-file and per-session scope, and many files in one session.
-- **Bash hook (79)**: adapted from shunt's `bash-hook-evals.json`, plus
+  overlaps, per-file and per-session scope, and many files in one session. Also
+  the outline in the deny message, the budget left, and both off switches.
+- **Bash hook (80)**: adapted from shunt's `bash-hook-evals.json`, plus
   compound commands, `cd`, globs, wrappers, rtk (`rtk read`, `--head-lines`,
   `rtk bypass`, `rtk cat`), real `rtk hook claude` rewrites, the recursion
-  guard, and head/tail paging against the read budget.
-- **Transport (22)**: `bulk-read` against a stub `claude`. It checks that file
+  guard, head/tail paging against the read budget, and `SHUNT_DISABLE`.
+- **Transport (27)**: `bulk-read` against a stub `claude`. It checks that file
   contents go on stdin and never in argv, the cached files block and its TTL
-  fallback, the child flags, `SHUNT_CHILD=1`, model and effort overrides, and
-  every loud-failure path.
+  fallback, the child flags, `SHUNT_CHILD=1`, model and effort overrides, every
+  loud-failure path, the citation check, and the usage log.
+- **Citation check (24)**: `lib/verify.py` on hand-written answers: quotes
+  after, under and below a citation, prose code, code past a parenthesis and
+  line numbers left unchecked, wrong lines, invented and elided quotes,
+  enclosing names and symbol labels inside and outside, instance calls and
+  labels in prose ignored, bare line references, unquoted citations, unsent
+  files.
+- **Session start (6)**: the largest-files list, its limit, and when it stays
+  silent.
+- **Usage log, toggle and report (9)**: what gets logged, `shunt-toggle`, and
+  `shunt-report` totals on a synthetic log.
 
 Where shunt's expected results differ here, the case's `reason` starts with
 CHANGED or FIXED. Bounded `head` and `tail` now pass (they work like Read with a
@@ -230,7 +377,7 @@ Five cases in `evals/<case>/case.yaml` run a real session against a generated
 | Case | Checks | Last run (3 runs each) |
 |---|---|---|
 | `overview-large-file` | accurate class overview, no Read of 200+ lines | 100% |
-| `bug-hunt-large-file` | reaches for `bulk-read` unprompted, no paging, finds the planted double-release bug | 89% |
+| `bug-hunt-large-file` | no paging, finds the planted double-release bug | 89% (before the outline) |
 | `full-read-denied` | an explicit full Read is denied, then answered correctly | 100% |
 | `edit-large-file` | edits via grep or a small Read, never a big chunk | 100% |
 | `small-file-direct` | a 3-line file is read directly, never delegated | 100% |
@@ -241,9 +388,108 @@ model reaches for the skill, avoids paging, and verifies narrowly) and the
 fallback answer, not Haiku's answer. `--live` above covers the real call. A
 full suite run costs about $1 on Sonnet.
 
+### A/B: task quality with and without delegation (`evals/ab/`)
+
+Token savings alone don't show whether delegation helps. `evals/ab/run.py`
+runs real tasks in headless `claude -p` sessions with the plugin on and off
+(`--plugin-dir` versus nothing; your own settings, hooks and MCP servers are
+left out of every arm) and scores the outcome, not the route. A third arm,
+`delegate`, loads the plugin and tells the main model to start with
+`bulk-read`, so Haiku's answers are tested on every task instead of only when
+the model chooses to delegate:
+
+| Task | Expected effect | Pass when |
+|---|---|---|
+| `overview` | helps | all 8 classes with their start lines (within 2) |
+| `locate` | helps | the retry method, the limit and the backoff |
+| `edit` | neutral | `LATE_FEE_RATE = 0.02` and no other line changed |
+| `debug` | risky | the failing test passes, only `inventory_service.py` changed |
+| `review` | risky | the double release is reported |
+| `security` | risky | the shell injection in `export_archive` is reported |
+| `crossfile` | risky | the swapped arguments in `order_api.py` are reported |
+| `rootcause` | risky | the failing test passes, and so do hidden tests that a fix of the symptom fails |
+| `security-precise` | risky | exactly the 2 exploitable `AuditTrail` methods, not the 2 decoys |
+| `negative-stock` | risky | exactly the 2 handlers that can drive stock below zero, one passing `force` by position |
+| `sign-audit` | recall | exactly the 2 of 67 handlers whose stock change has the wrong sign |
+
+The last four are harder: each has a trap that taking Haiku's word, or
+patching where the symptom shows, falls into, and the answer is graded exactly
+(a final `ANSWER:` line, or hidden tests run after the session), so a wrong
+extra fails as surely as a miss. `rootcause`'s class stores a booking in cases
+but counts it in units, and a comment points the fix at the wrong method;
+`security-precise` has a validated `subprocess.run` list and a `shell=True` on
+a fixed command beside a real shell injection and a path traversal.
+
+The workspace (`evals/ab/workspace.py`) also plants traps for the first risky tasks: a
+comment in `release` that claims a second release is a no-op, a shell command
+built from input, and a call in a second large file with two arguments
+swapped. Per run it records task success, turns, cost (main session plus
+Haiku), main-session tokens, the largest context the main model saw, tool
+output that entered the context, failed Edits, `bulk-read` calls, denies and
+flagged citations, then compares the arms per task.
+
+```bash
+python3 evals/ab/run.py --dry-run                  # the plan: 11 tasks x 2 arms (on, off) x 3 runs
+python3 evals/ab/run.py --max-cost-usd 10 -j 3     # results in evals/results/ab-<time>/
+python3 evals/ab/run.py --tasks debug,review --runs 5
+python3 evals/ab/run.py --arms delegate            # Haiku on every task: 33 sessions, about $3
+```
+
+A full run is 66 sessions, about $6–10 on Sonnet. A pass-rate drop on a risky
+task means the "Haiku locates, you judge" guidance isn't holding there.
+
+Last full run (2026-11-07 for `on` and `off`, $6.09; 2026-11-08 for
+`delegate`, $2.75; Sonnet 5.5, 3 runs per arm), per run:
+
+| Task | Pass on / off / delegate | Cost on / off / delegate | Peak context on / off / delegate | Turns on / off / delegate |
+|---|---|---|---|---|
+| `overview` | 3/3 / 3/3 / 3/3 | $0.085 / $0.126 / $0.072 | 39.2k / 51.1k / 37.2k | 5.7 / 4.0 / 4.0 |
+| `locate` | 3/3 / 3/3 / 3/3 | $0.050 / $0.092 / $0.066 | 34.3k / 45.3k / 36.4k | 3.0 / 3.0 / 6.0 |
+| `edit` | 3/3 / 3/3 / 3/3 | $0.047 / $0.045 / $0.066 | 34.0k / 33.7k / 36.0k | 3.0 / 3.0 / 6.0 |
+| `debug` | 3/3 / 3/3 / 3/3 | $0.067 / $0.066 / $0.081 | 36.1k / 36.1k / 38.0k | 6.3 / 6.0 / 7.0 |
+| `review` | 3/3 / 3/3 / 3/3 | $0.084 / $0.123 / $0.088 | 38.8k / 50.8k / 38.7k | 5.7 / 3.0 / 7.0 |
+| `security` | 3/3 / 3/3 / 3/3 | $0.110 / $0.126 / $0.085 | 43.2k / 50.8k / 38.3k | 7.3 / 3.0 / 6.7 |
+| `crossfile` | 3/3 / 3/3 / 3/3 | $0.087 / $0.164 / $0.096 | 39.5k / 62.1k / 41.0k | 7.0 / 4.0 / 6.3 |
+| `rootcause` | 3/3 / 3/3 / 3/3 | $0.097 / $0.071 / $0.094 | 39.4k / 36.5k / 39.4k | 10.3 / 6.0 / 8.7 |
+| `security-precise` | 3/3 / 3/3 / 3/3 | $0.083 / $0.106 / $0.087 | 39.0k / 42.8k / 38.6k | 5.0 / 6.3 / 6.7 |
+| `negative-stock` | 3/3 / 3/3 / 3/3 | $0.104 / $0.130 / $0.099 | 42.6k / 48.1k / 40.9k | 8.7 / 7.7 / 8.0 |
+| `sign-audit` | 3/3 / 3/3 / 3/3 | $0.079 / $0.087 / $0.082 | 39.4k / 40.6k / 39.2k | 4.3 / 4.7 / 5.7 |
+| all | 100% / 100% / 100% | $0.081 / $0.103 / $0.083 | 38.7k / 45.3k / 38.5k | 6.0 / 4.6 / 6.5 |
+
+What it shows:
+
+- No task got worse in any arm, including the hard ones with decoys and
+  hidden tests. In `delegate`, Haiku answered first in all 33 sessions, so
+  this covers Haiku's answers, not only the routing.
+- With the plugin on, cost per run fell 21% and peak context 15%, at the
+  price of more turns (6.0 against 4.6): the model reads ranges instead of
+  whole files. `rootcause` is the exception, 37% dearer: tracing a cause
+  across methods took more narrow reads than reading the file once.
+- The main model judged for itself. On every task that needed a judgment, it
+  read or grepped the lines Haiku pointed to before answering; only
+  `overview` went on Haiku's answer alone.
+- Forcing delegation gains nothing over letting the model choose: `delegate`
+  costs about the same as `on` ($0.083 against $0.081), and more on small
+  tasks (`locate`, `edit`, `debug`), where a whole-file call is wasted. The
+  default routing, which delegates only when a file needs understanding
+  whole, stays as is. Haiku cost $0.10 across the 33 sessions.
+- Of the 1,173 citations in Haiku's answers across these runs, the citation
+  check flags 1, and that one is real (a signature quoted without `self`);
+  114 had no quote to check. Before the rules above were tightened against
+  these answers it raised about 30 false alarms, mostly code mentioned in
+  passing.
+
 ## Not included
 
 Shunt's `code-write` (delegated code generation) is out of scope for now.
+
+An agentic reader (a child that can grep and re-read) isn't included. One
+call already puts the whole files in Haiku's context, so it can only miss
+what it misreads, and the citation check catches misplaced quotes. An agentic
+reader would help with files too big for one call or repo-wide searches, at
+several times the cost and latency. The last A/B run, including the arm that
+sends every task through Haiku, showed no recall failures; add it if a later
+one does.
 
 ## License
 

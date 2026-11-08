@@ -9,7 +9,7 @@
       "name": "shunt-cc",
       "source": "./",
       "description": "Haiku-backed large-file reader: hooks redirect full reads of large files to a bulk-reader skill backed by headless Claude Code.",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }

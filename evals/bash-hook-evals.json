@@ -82,6 +82,7 @@
     { "name": "budget-shared-with-read", "prior": [{"command": "head -n 500 {{FIXTURES}}/large.txt"}], "command": "tail -n 200 {{FIXTURES}}/large.txt", "expected_decision": "deny", "reason": "A small tail after a big head still crosses the budget: 700 lines" },
     { "name": "env-override-lower", "command": "cat {{FIXTURES}}/medium.txt", "env": {"SHUNT_MIN_LINES": "200"}, "expected_decision": "deny", "reason": "SHUNT_MIN_LINES=200: 250 lines denied" },
     { "name": "recursion-guard-cat", "command": "cat {{FIXTURES}}/huge.txt", "env": {"SHUNT_CHILD": "1"}, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" },
-    { "name": "recursion-guard-rtk", "command": "rtk read {{FIXTURES}}/huge.txt", "env": {"SHUNT_CHILD": "1"}, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" }
+    { "name": "recursion-guard-rtk", "command": "rtk read {{FIXTURES}}/huge.txt", "env": {"SHUNT_CHILD": "1"}, "expected_decision": "allow", "reason": "SHUNT_CHILD=1: hooks allow everything" },
+    { "name": "disable-env", "command": "cat {{FIXTURES}}/huge.txt", "env": {"SHUNT_DISABLE": "1"}, "expected_decision": "allow", "reason": "SHUNT_DISABLE=1 turns the hooks off" }
   ]
 }

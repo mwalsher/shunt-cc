@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Turn shunt-cc off or on for the current Claude Code session.
+
+Usage: shunt-toggle off|on|status
+
+The session comes from CLAUDE_CODE_SESSION_ID, which Claude Code sets for its
+Bash tool. While a session is off, the hooks pass every read through and list
+no files at session start; bulk-read still works if called. To turn shunt-cc
+off everywhere, set SHUNT_DISABLE=1 instead.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import shunt_state  # noqa: E402
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action not in ("off", "on", "status"):
+        print("usage: shunt-toggle off|on|status", file=sys.stderr)
+        sys.exit(2)
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if os.environ.get("SHUNT_DISABLE", "") not in ("", "0"):
+        print("shunt-cc is off everywhere: SHUNT_DISABLE is set.")
+        return
+    if not session:
+        print("shunt-toggle: no CLAUDE_CODE_SESSION_ID here, so there is no session to "
+              "switch. Set SHUNT_DISABLE=1 to turn shunt-cc off.", file=sys.stderr)
+        sys.exit(1)
+    flag = shunt_state.off_flag(session)
+    if action == "off":
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        open(flag, "w").close()
+        shunt_state.log_event("toggle", session=session, state="off")
+    elif action == "on" and os.path.exists(flag):
+        os.remove(flag)
+        shunt_state.log_event("toggle", session=session, state="on")
+    print("shunt-cc is {} for this session.".format("off" if os.path.exists(flag) else "on"))
+
+
+if __name__ == "__main__":
+    main()
